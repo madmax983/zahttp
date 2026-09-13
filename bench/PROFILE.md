@@ -25,9 +25,13 @@ bash bench/measure_syscalls.sh 20 100   # 20 connections x 100 requests = 2000
 ```
 
 This builds the binary exactly as documented
-(`rustc --edition 2021 -O -o <bin> main.rs`), runs it under `strace -f -c`
-(`-f` because each connection is served on its own `std::thread`), replays
-the fixed request mix, and reports the syscall summary.
+(originally `rustc --edition 2021 -O -o <bin> main.rs` against the
+single-file `main.rs`; after the module-tree refactor merged into this
+branch, `rustc -O -C debuginfo=0 -o <bin> main.rs` with the module files
+picked up automatically), runs it under `strace -f -c` (`-f` because each
+connection is served on its own `std::thread`), replays the fixed request
+mix, and reports the syscall summary. `bench/measure_syscalls.sh` always
+uses the current documented invocation.
 
 ## 📈 Profile (baseline, this repo's `main.rs` before any change)
 
@@ -96,8 +100,8 @@ behavior, byte layout, or existing test/verification expectation changes.
 ## 📊 Measurement
 
 `bench/measure_syscalls.sh 20 100`, same fixed seeded workload, same
-machine, same session — `strace -f -c` on an `rustc --edition 2021 -O`
-build, before vs. after:
+machine, same session — `strace -f -c` on an optimized `rustc` build,
+before vs. after:
 
 | syscall (response-path)        | before | after | delta |
 |---------------------------------|-------:|------:|------:|
@@ -123,15 +127,29 @@ two or more TCP segments (header write, then a separately-flushed body
 write), and this box's TCP stack was visibly paying ~40ms per split
 response before this change.
 
+### Post-merge re-verification
+
+While this PR was open, upstream `main` split `main.rs` into a module
+tree (`alloc.rs`/`buf.rs`/`http.rs`/`routes.rs`/`ranges.rs`/`gzip.rs`/
+`multipart.rs`/`sse.rs`/`ws.rs`) and added a new `/events` endpoint. The
+five touched functions moved with byte-identical bodies, so the fix was
+ported as-is (`write_all_vectored()` now lives in `http.rs`). Re-running
+`bench/measure_syscalls.sh 20 100` against the merged tree reproduced
+**the same write-family count, 5,771** — the port changed nothing
+observable. `sse.rs`/`/events` is untouched: it wasn't part of the
+profiled baseline, so extending this fix to it is out of scope here.
+
 ## 🔬 Reproduce
 
 ```
-git checkout <baseline-commit>   # RED: harness + baseline, main.rs unchanged
+git checkout <RED commit>     # harness + baseline, no fix yet
 bash bench/measure_syscalls.sh 20 100
 
-git checkout <this-commit>       # GREEN: main.rs fix applied
+git checkout <this branch>    # fix applied (and ported through the later merge)
 bash bench/measure_syscalls.sh 20 100
 ```
 
-Both runs build with the documented `rustc --edition 2021 -O -o <bin>
-main.rs` — no `Cargo.toml`, no crates added.
+Both runs build with the currently documented `rustc` invocation for this
+repo (no `Cargo.toml`, no crates added) — see `README.md`'s "Zero
+dependency" line for the exact command, which `bench/measure_syscalls.sh`
+always tracks.
