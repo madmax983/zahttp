@@ -1,12 +1,16 @@
 # zahttp
 
-A zero-dependency, zero-allocation HTTP/1.1 server. One file, `main.rs`.
-`std` only — no Cargo project, no crates, no `extern` anything.
+A zero-dependency, zero-allocation HTTP/1.1 server. `std` only — no Cargo
+project, no crates, no `extern` anything. One `rustc` invocation builds a
+small module tree (see [Layout](#layout)); every module obeys the same
+no-heap rules.
 
 ## The rules
 
-- **Zero dependency:** compiled with `rustc --edition 2021 -O -o zahttp main.rs`.
-  There is no `Cargo.toml`. There is nothing to `cargo add`.
+- **Zero dependency:** compiled with `rustc -O -C debuginfo=0 -o zahttp main.rs`.
+  There is no `Cargo.toml`. There is nothing to `cargo add`. Module files
+  (`mod foo;` in `main.rs`) are picked up automatically by that one
+  invocation.
 - **Zero allocation (in our code):** no heap types, no `format!`, no `vec!`,
   no panicking helpers in the hot loop. Every byte lives in a fixed-size
   stack buffer (`[u8; 8192]` for the request head, `[u8; 4096]` for bodies)
@@ -40,7 +44,7 @@ The ~30 baseline is process startup and per-connection thread spawn —
 | `/allocs`    | GET    | heap allocation counter (the proof)                |
 | `/bytes`     | GET/HEAD | 64 KiB deterministic body with RFC 7233 ranges, `If-None-Match`, and `Accept-Encoding: gzip` (see below) |
 | `/upload`    | POST   | parses `multipart/form-data` bodies, returns a part summary (see below) |
-| `/events`    | GET/HEAD | Server-Sent Events stream: 5 deterministic events, `Last-Event-ID` resume (see below) |
+| `/events`    | GET/HEAD | Server-Sent Events: an infinite live tick feed, 1/s, `Last-Event-ID` resume (see below) |
 
 Also: proper `Date`/`Server`/`Content-Length`/`Connection` headers,
 HTTP/1.0 + 1.1 keep-alive with pipelined-byte shifting, `400`/`404`/`405`/
@@ -49,26 +53,49 @@ HTTP/1.0 + 1.1 keep-alive with pipelined-byte shifting, `400`/`404`/`405`/
 
 ## Server-Sent Events (the dare, 2026-09-13)
 
-`GET`/`HEAD /events` serves a deterministic 5-event stream per the HTML
-spec — `Content-Type: text/event-stream`, `Cache-Control: no-cache`, a
-`: zahttp event stream` comment plus `retry: 3000` preamble, three `tick`
-events, one multi-line `note` event, and a closing `bye` event. Zero heap:
-every frame is assembled in one reused 128-byte stack buffer and written
-as its own chunk.
+`GET`/`HEAD /events` serves an **infinite** live feed per the HTML spec —
+`Content-Type: text/event-stream`, `Cache-Control: no-cache`, a
+`: zahttp event stream` comment plus `retry: 3000` preamble, then one
+`tick` event per second, forever: `id: N`, `event: tick`, `data: N`.
+Zero heap: every frame is assembled in one reused 128-byte stack buffer
+and written as its own chunk; the connection thread parks in
+`thread::sleep` between ticks, and the first failed write (client gone)
+is the only exit.
 
-- **Framing**: `Transfer-Encoding: chunked` on HTTP/1.1 (terminating
-  zero chunk, connection stays alive for pipelining); close-delimited on
-  HTTP/1.0 — the server forces `Connection: close` there since a
-  body with no length and no chunks can't persist.
-- `Last-Event-ID` resumes the stream after that id (absent or garbage →
-  0; `>= 5` → preamble only). `HEAD` returns headers only with no
-  `Transfer-Encoding` promised.
-- Verification: 39 protocol checks green — exact SSE field/blank-line
-  framing, multi-line `data:` reconstruction, nine `Last-Event-ID`
-  cases (absent, garbage, empty, 0, 2, 4, 5, 99, u64::MAX), chunk
-  boundaries, HEAD, pipelining after a completed stream, HTTP/1.0
-  close behavior, `OPTIONS`/`Allow`, `POST` → 405 — and `/allocs`
-  moved **0** across 25 streams on one keep-alive connection.
+- **Framing**: `Transfer-Encoding: chunked` on HTTP/1.1 (no terminating
+  chunk — the stream never ends; the connection belongs to the feed
+  until the client leaves); close-delimited on HTTP/1.0 with a forced
+  `Connection: close`, since a body with no length and no chunks can't
+  persist.
+- `Last-Event-ID` resumes the tick counter after that id (absent or
+  garbage → 0; `u64::MAX` wraps to 1). `HEAD` returns headers only with
+  no `Transfer-Encoding` promised.
+- Verification: 28 protocol checks green — headers, preamble, tick ids
+  1–5, `event: tick` + `data == id`, ~1 s pacing measured on the wire,
+  resume from 41 and from garbage, `u64::MAX` wrap, HEAD, HTTP/1.0
+  close-delimited bytes, `OPTIONS`/`Allow`, `POST` → 405 — and streaming
+  allocated exactly as much as a bare `/health` connection (thread
+  spawn + one request; the per-tick delta is **0**).
+
+## Layout
+
+`main.rs` holds the connection driver (`serve`/`run`/`main`) and nothing
+else. Everything else is a module with one job:
+
+| Module         | Job                                                        |
+|----------------|------------------------------------------------------------|
+| `alloc.rs`     | the counting global allocator — the proof                   |
+| `buf.rs`       | `Out`, the fixed-buffer writer; HTTP dates; integer parsing |
+| `http.rs`      | request parsing, framing, `Expect`, the `send()` writer     |
+| `routes.rs`    | `INDEX`, `route()`, `OPTIONS`, small handlers               |
+| `sse.rs`       | `GET /events` — the infinite Server-Sent Events feed        |
+| `ranges.rs`    | `GET/HEAD /bytes` — RFC 7233 ranges + conditionals          |
+| `gzip.rs`      | hand-rolled DEFLATE/gzip for `/bytes` content-encoding      |
+| `multipart.rs` | `POST /upload` — RFC 7578 parsing, in place                 |
+| `ws.rs`        | `GET /ws` — RFC 6455 WebSocket, handshake + frame codec      |
+
+The static gate runs over every module: no `String`, `Vec<`, `Box<`,
+`format!`, `vec!`, `unwrap()`, or `expect(` in authored code.
 
 ## gzip content-encoding (the dare, 2026-09-13)
 
