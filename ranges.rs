@@ -4,7 +4,7 @@ use std::io::Write;
 use std::net::TcpStream;
 use std::sync::LazyLock;
 
-use crate::buf::{date_now, parse_u64b, Out};
+use crate::buf::{date_now, parse_u64b, write2, Out};
 use crate::routes::reason;
 use crate::gzip::{gzip_encode, GZIP_CAP};
 use crate::http::{header, trim, Request};
@@ -177,13 +177,8 @@ pub(crate) fn send_range_full(stream: &mut TcpStream, keep_alive: bool, with_bod
     if h.overflow {
         return false;
     }
-    if !stream.write_all(h.as_slice()).is_ok() {
-        return false;
-    }
-    if with_body {
-        return stream.write_all(&RANGE_BODY[..]).is_ok();
-    }
-    true
+    let body: &[u8] = if with_body { &RANGE_BODY[..] } else { &[] };
+    write2(stream, h.as_slice(), body)
 }
 
 pub(crate) fn send_gzip_full(stream: &mut TcpStream, keep_alive: bool, with_body: bool) -> bool {
@@ -200,13 +195,8 @@ pub(crate) fn send_gzip_full(stream: &mut TcpStream, keep_alive: bool, with_body
     if h.overflow {
         return false;
     }
-    if !stream.write_all(h.as_slice()).is_ok() {
-        return false;
-    }
-    if with_body {
-        return stream.write_all(&gz.1[..gz.0]).is_ok();
-    }
-    true
+    let body: &[u8] = if with_body { &gz.1[..gz.0] } else { &[] };
+    write2(stream, h.as_slice(), body)
 }
 
 pub(crate) fn send_range_single(
@@ -234,15 +224,12 @@ pub(crate) fn send_range_single(
     if h.overflow {
         return false;
     }
-    if !stream.write_all(h.as_slice()).is_ok() {
-        return false;
-    }
-    if with_body {
-        return stream
-            .write_all(&RANGE_BODY[first as usize..=last as usize])
-            .is_ok();
-    }
-    true
+    let body: &[u8] = if with_body {
+        &RANGE_BODY[first as usize..=last as usize]
+    } else {
+        &[]
+    };
+    write2(stream, h.as_slice(), body)
 }
 
 pub(crate) fn send_range_multi(
