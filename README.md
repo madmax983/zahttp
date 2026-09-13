@@ -216,6 +216,33 @@ advertised on every 200, 206, gzip 200, and 304:
   precedence ordering, Range interaction, garbage tolerance. `/allocs`
   delta **0** across 200 mixed conditional requests on one connection.
 
+## Connection lifecycle (the dare, 2026-09-13)
+
+Three nginx-style knobs bound how long a client may hold the server,
+all enforced with atomics and socket timeouts — no heap, no reaper
+thread:
+
+- `KEEPALIVE_TIMEOUT_SECS = 5`: every read gets a 5-second idle
+  deadline. A silent connect-and-send-nothing, an idle keep-alive gap,
+  and a slowloris dribble are all reaped the same way — the timed-out
+  read falls into the existing error paths and the connection closes
+  cleanly. Honest caveat: it is a *per-read* timeout, so 1 byte per 4.9
+  seconds could linger; a total head/body deadline is future work.
+- `KEEPALIVE_REQUESTS = 100`: a connection serves at most 100 requests;
+  the 100th is answered `Connection: close` even if the client asked to
+  keep alive.
+- `MAX_CONNECTIONS = 128`: an atomic counter in the accept loop caps
+  concurrent connections; over-cap connects get a bare `503 Service
+  Unavailable` with no request read, then close.
+- Upgraded websockets are exempt from the read timeout — an upgraded
+  connection is no longer HTTP keep-alive, so a quiet websocket must
+  not be reaped as idle HTTP. (SSE never reads, so it is unaffected.)
+- Verification: 7 checks green — 1–99 keep-alive with close on the
+  100th, idle-gap reaping, silent-connection reaping, 503 at 129
+  concurrent. The nagle regression needed one honest update: it now
+  reconnects every 90 requests instead of assuming a connection lives
+  forever. `/allocs` delta **0** across 90 keep-alive requests.
+
 ## Expect: 100-continue (the dare, 2026-09-13)
 
 Clients may send `Expect: 100-continue` and wait for the interim
