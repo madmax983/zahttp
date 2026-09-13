@@ -2,7 +2,7 @@
 
 use std::io::{IoSlice, Write};
 use std::net::TcpStream;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // ---- fixed capacities: the whole server lives in these ------------------
 
@@ -163,27 +163,51 @@ pub(crate) fn parse_u64b(s: &[u8]) -> Option<u64> {
     Some(v)
 }
 
-// ---- write2: one vectored write for head+body ---------------------------
-// Performance contract: every non-streaming response emits its headers
-// and body in a single write_vectored() call. A tiny header followed by
-// a tiny body used to leave as two separate write() calls; with Nagle
-// enabled the second, small segment waited on the delayed ACK of the
-// first (~40 ms on loopback), which is why sequential /health showed a
-// 41 ms p50 while the head arrived in under 1 ms. One writev means one
-// segment, so the pair can never be split across the ACK boundary again.
-//
-// Partial writes are handled by looping and advancing across both
-// slices — a vectored write is never assumed to take everything. The
-// IoSlice pair lives on the stack: zero allocation, like everything
-// else here. Ok(0) on a non-empty write means the peer is gone; we
-// report failure instead of spinning.
-pub(crate) fn write2(stream: &mut TcpStream, a: &[u8], b: &[u8]) -> bool {
+// ---- write_all_before / write2_before: deadline-bounded writes --------
+// Mirror of http::read_before: each write is bounded by the time left,
+// so a client that never reads can't wedge a thread in send() forever.
+// The socket timeout is re-armed before every write call. On expiry (or
+// a dead peer) they return false and the caller closes the connection —
+// there is no point answering 500 to a client that won't read.
+// write2_before keeps the single-writev head+body Nagle contract.
+pub(crate) fn write_all_before(
+    stream: &mut TcpStream,
+    mut buf: &[u8],
+    deadline: Instant,
+) -> bool {
+    while !buf.is_empty() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let _ = stream.set_write_timeout(Some(remaining));
+        match stream.write(buf) {
+            Ok(0) => return false,
+            Ok(n) => buf = &buf[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+pub(crate) fn write2_before(
+    stream: &mut TcpStream,
+    a: &[u8],
+    b: &[u8],
+    deadline: Instant,
+) -> bool {
     let mut a = a;
     let mut b = b;
     loop {
         if a.is_empty() && b.is_empty() {
             return true;
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let _ = stream.set_write_timeout(Some(remaining));
         let bufs = [IoSlice::new(a), IoSlice::new(b)];
         let from = usize::from(a.is_empty());
         match stream.write_vectored(&bufs[from..]) {
@@ -195,37 +219,7 @@ pub(crate) fn write2(stream: &mut TcpStream, a: &[u8], b: &[u8]) -> bool {
                 rem -= take;
                 b = &b[rem.min(b.len())..];
             }
-            Err(_) => return false,
-        }
-    }
-}
-
-// write2's three-buffer twin, for send_chunked's <hexlen>\r\n + payload +
-// \r\n framing: the same Nagle reasoning applies per chunk, not just per
-// response, and it used to cost three write() calls per chunk instead
-// of one.
-pub(crate) fn write3(stream: &mut TcpStream, a: &[u8], b: &[u8], c: &[u8]) -> bool {
-    let mut a = a;
-    let mut b = b;
-    let mut c = c;
-    loop {
-        if a.is_empty() && b.is_empty() && c.is_empty() {
-            return true;
-        }
-        let bufs = [IoSlice::new(a), IoSlice::new(b), IoSlice::new(c)];
-        let from = usize::from(a.is_empty()) + usize::from(a.is_empty() && b.is_empty());
-        match stream.write_vectored(&bufs[from..]) {
-            Ok(0) => return false,
-            Ok(n) => {
-                let mut rem = n;
-                let take = rem.min(a.len());
-                a = &a[take..];
-                rem -= take;
-                let take = rem.min(b.len());
-                b = &b[take..];
-                rem -= take;
-                c = &c[rem.min(c.len())..];
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => return false,
         }
     }
