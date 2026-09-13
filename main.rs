@@ -36,17 +36,16 @@ mod routes;
 mod sse;
 mod ws;
 
-use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::alloc::REQUEST_COUNT;
 use crate::buf::{Out, BODY_CAP, READ_CAP, RESP_BODY_CAP};
 use crate::http::{
     content_length_of, decode_chunked, expect_of, find_double_crlf, is_chunked, keep_alive,
-    parse_head, path_of, send_100, Expect, Parse,
+    parse_head, path_of, read_before, send_100, Expect, Parse,
 };
 use crate::ranges::send_ranges;
 use crate::routes::{route, send, send_chunked, send_options};
@@ -54,18 +53,23 @@ use crate::sse::send_events;
 use crate::ws::ws_serve;
 
 // ---- connection lifecycle -------------------------------------------------
-// nginx-style knobs, enforced with atomics and socket timeouts — no heap.
+// nginx-style knobs, enforced with atomics and deadline-bounded reads —
+// no heap.
 //
-// KEEPALIVE_TIMEOUT_SECS bounds every read: an idle keep-alive gap, a
-// client that connects and sends nothing, and a slowloris dribble all
-// get reaped. (Caveat, documented not hidden: it is a per-read idle
-// timeout, so 1 byte per 4.9 seconds could linger; a total head/body
-// deadline is future work.)
+// HEAD_TIMEOUT_SECS is a TOTAL deadline for the request head, re-armed
+// per request: pre-request silence, idle keep-alive gaps, and slow header
+// dribbles all die here. BODY_TIMEOUT_SECS is a TOTAL deadline for the
+// request body (content-length and chunked). Each read is bounded by the
+// time left, so the old 1-byte-per-4.9-seconds slowloris loophole is
+// closed: dribbles die at the deadline. Expiry closes the connection
+// silently (a chunked timeout answers 400 like any other body error,
+// then closes).
 // KEEPALIVE_REQUESTS caps requests per connection; the last one is
 // answered `Connection: close`, nginx-style.
 // MAX_CONNECTIONS caps concurrent connections; over-cap connects get a
 // bare `503 Service Unavailable` with no request read, then close.
-const KEEPALIVE_TIMEOUT_SECS: u64 = 5;
+const HEAD_TIMEOUT_SECS: u64 = 5;
+const BODY_TIMEOUT_SECS: u64 = 5;
 const KEEPALIVE_REQUESTS: u64 = 100;
 const MAX_CONNECTIONS: usize = 128;
 static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
@@ -76,12 +80,13 @@ fn serve(mut stream: TcpStream) {
     let mut buf = [0u8; READ_CAP];
     let mut n = 0usize;
     let mut served = 0u64;
-    // Idle keep-alive gaps, pre-request silence, and slow dribbles all
-    // die here; a timed-out read lands in the existing `Err(_) => return`
-    // paths below and the connection closes cleanly.
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(KEEPALIVE_TIMEOUT_SECS)));
+    // Every read below goes through read_before() with a total deadline,
+    // so the socket needs no standing timeout of its own.
     loop {
-        // 1. read until the head is complete
+        // 1. read until the head is complete. Total deadline, re-armed per
+        // request: idle gaps, pre-request silence, and slow header
+        // dribbles all die here.
+        let head_deadline = Instant::now() + Duration::from_secs(HEAD_TIMEOUT_SECS);
         let head_end: usize = loop {
             if let Some(p) = find_double_crlf(&buf[..n]) {
                 break p;
@@ -90,7 +95,7 @@ fn serve(mut stream: TcpStream) {
                 send(&mut stream, 431, "text/plain", b"head too large\n", false, true);
                 return;
             }
-            match stream.read(&mut buf[n..]) {
+            match read_before(&mut stream, &mut buf[n..], head_deadline) {
                 Ok(0) => return,
                 Ok(k) => n += k,
                 Err(_) => return,
@@ -115,12 +120,15 @@ fn serve(mut stream: TcpStream) {
             send(&mut stream, 417, "text/plain", b"expectation failed\n", false, true);
             return;
         }
+        // 2c. total body deadline, armed once the head is in: content-
+        // length and chunked dribbles both die here.
+        let body_deadline = Instant::now() + Duration::from_secs(BODY_TIMEOUT_SECS);
         if chunked {
             if expect == Expect::Continue && !send_100(&mut stream) {
                 return;
             }
             let mut pos = body_start;
-            let dlen = match decode_chunked(&mut stream, &mut buf, body_start, &mut pos, &mut n, &mut decoded) {
+            let dlen = match decode_chunked(&mut stream, &mut buf, body_start, &mut pos, &mut n, &mut decoded, body_deadline) {
                 Ok(l) => l,
                 Err(s) => {
                     let msg: &[u8] = if s == 413 { b"body too large\n" } else { b"bad request\n" };
@@ -153,7 +161,7 @@ fn serve(mut stream: TcpStream) {
                     send(&mut stream, 413, "text/plain", b"body too large\n", false, true);
                     return;
                 }
-                match stream.read(&mut buf[n..]) {
+                match read_before(&mut stream, &mut buf[n..], body_deadline) {
                     Ok(0) => return,
                     Ok(k) => n += k,
                     Err(_) => return,
