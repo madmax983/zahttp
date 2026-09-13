@@ -39,11 +39,39 @@ The ~30 baseline is process startup and per-connection thread spawn —
 | `/metrics`   | GET    | request counter                                    |
 | `/allocs`    | GET    | heap allocation counter (the proof)                |
 | `/bytes`     | GET/HEAD | 64 KiB deterministic body with RFC 7233 range support (see below) |
+| `/upload`    | POST   | parses `multipart/form-data` bodies, returns a part summary (see below) |
 
 Also: proper `Date`/`Server`/`Content-Length`/`Connection` headers,
 HTTP/1.0 + 1.1 keep-alive with pipelined-byte shifting, `400`/`404`/`405`/
 `413`/`431`/`505` as appropriate, and a hand-rolled decimal printer
 (`push_u64`) because `format!` was disqualified.
+
+## Multipart form parsing (the dare, 2026-09-13)
+
+`POST /upload` with `Content-Type: multipart/form-data; boundary=...`
+parses the body per RFC 7578 and returns a plain-text summary:
+
+```
+parts: 2
+part 0: name="field1" filename="-" type="text/plain" size=6
+part 1: name="file" filename="a.txt" type="text/plain" size=12
+```
+
+- Byte-level parser over the borrowed request body: `memfind`/`at`
+  helpers, no copies. Part descriptors (`name`, `filename`,
+  `content_type`, body slice) live in a fixed `[FormPart; 16]` — all
+  strings borrow from the body buffer.
+- `boundary=` is extracted with a parameter scanner that respects
+  quoting and requires parameter boundaries, so `name=` never matches
+  inside `filename=` (tested both orders). Quoted boundaries work;
+  backslash escapes inside quoted values are *not* processed
+  (documented simplification, like the naive boundary search).
+- Limits: 16 parts max (`413` beyond), 128-byte boundary cap, and the
+  usual 4 KiB body cap. Missing/non-multipart content type, garbage
+  framing, or a truncated body (no closing `--boundary--`) → `400`.
+  Works with `Content-Length` and chunked request bodies alike.
+- Verification: 18 protocol checks green, and `/allocs` moved **0**
+  across 30 five-part uploads on one keep-alive connection.
 
 ## Range requests (the dare, 2026-09-13)
 
