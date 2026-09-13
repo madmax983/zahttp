@@ -1,9 +1,11 @@
 // zahttp module: ws (RFC 6455) — zero deps, zero heap. See main.rs for the rules.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::TcpStream;
+use std::time::Instant;
 
-use crate::buf::{date_now, write2, Out};
+use crate::buf::{date_now, write2_before, write_all_before, Out};
+use crate::write_deadline;
 use crate::http::{header, trim, Request};
 
 // ---- SHA-1 (FIPS 180-4), hand-rolled ------------------------------------
@@ -153,7 +155,7 @@ pub(crate) fn header_has_token(req: &Request, name: &str, token: &[u8]) -> bool 
     false
 }
 
-pub(crate) fn ws_reject(stream: &mut TcpStream, status: u16, reason: &str, version_header: bool) {
+pub(crate) fn ws_reject(stream: &mut TcpStream, status: u16, reason: &str, version_header: bool, deadline: Instant) {
     let mut hbuf = [0u8; 256];
     let mut h = Out::new(&mut hbuf);
     h.push_str("HTTP/1.1 ");
@@ -166,7 +168,7 @@ pub(crate) fn ws_reject(stream: &mut TcpStream, status: u16, reason: &str, versi
     }
     h.push_str("Connection: close\r\n\r\n");
     if !h.overflow {
-        let _ = stream.write_all(h.as_slice());
+        let _ = write_all_before(stream, h.as_slice(), deadline);
     }
 }
 
@@ -202,7 +204,7 @@ pub(crate) fn ws_drain(stream: &mut TcpStream, len: u64) -> bool {
 }
 
 // Send one server-to-client frame (never masked, FIN always set).
-pub(crate) fn ws_send(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> bool {
+pub(crate) fn ws_send(stream: &mut TcpStream, opcode: u8, payload: &[u8], deadline: Instant) -> bool {
     let mut hbuf = [0u8; 10];
     hbuf[0] = 0x80 | opcode;
     let hlen = if payload.len() < 126 {
@@ -215,44 +217,44 @@ pub(crate) fn ws_send(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> boo
         4
     };
     // One writev for frame head+payload: same Nagle reasoning as
-    // buf::write2 — a tiny echo frame must not wait on a delayed ACK.
-    write2(stream, &hbuf[..hlen], payload)
+    // buf::write2_before — a tiny echo frame must not wait on a delayed ACK.
+    write2_before(stream, &hbuf[..hlen], payload, deadline)
 }
 
-pub(crate) fn ws_close(stream: &mut TcpStream, code: u16, reason: &[u8]) {
+pub(crate) fn ws_close(stream: &mut TcpStream, code: u16, reason: &[u8], deadline: Instant) {
     let mut pbuf = [0u8; 125];
     pbuf[0] = (code >> 8) as u8;
     pbuf[1] = code as u8;
     let rlen = reason.len().min(123);
     pbuf[2..2 + rlen].copy_from_slice(&reason[..rlen]);
-    let _ = ws_send(stream, 0x8, &pbuf[..2 + rlen]);
+    let _ = ws_send(stream, 0x8, &pbuf[..2 + rlen], deadline);
 }
 
-pub(crate) fn ws_serve(stream: &mut TcpStream, req: &Request) {
+pub(crate) fn ws_serve(stream: &mut TcpStream, req: &Request, deadline: Instant) {
     // An upgraded connection is no longer HTTP keep-alive, so the HTTP
     // idle read timeout must not reap a quiet websocket.
     let _ = stream.set_read_timeout(None);
     match header(req, "sec-websocket-version") {
         Some("13") => {}
         Some(_) => {
-            ws_reject(stream, 426, "Upgrade Required", true);
+            ws_reject(stream, 426, "Upgrade Required", true, deadline);
             return;
         }
         None => {
-            ws_reject(stream, 400, "Bad Request", false);
+            ws_reject(stream, 400, "Bad Request", false, deadline);
             return;
         }
     }
     if !header_has_token(req, "upgrade", b"websocket")
         || !header_has_token(req, "connection", b"upgrade")
     {
-        ws_reject(stream, 400, "Bad Request", false);
+        ws_reject(stream, 400, "Bad Request", false, deadline);
         return;
     }
     let key = match header(req, "sec-websocket-key") {
         Some(k) if !k.is_empty() && k.len() <= 64 => k,
         _ => {
-            ws_reject(stream, 400, "Bad Request", false);
+            ws_reject(stream, 400, "Bad Request", false, deadline);
             return;
         }
     };
@@ -272,7 +274,7 @@ pub(crate) fn ws_serve(stream: &mut TcpStream, req: &Request) {
     h.push_str("\r\nServer: zahttp/0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ");
     h.push(&accept[..alen]);
     h.push_str("\r\n\r\n");
-    if h.overflow || !stream.write_all(h.as_slice()).is_ok() {
+    if h.overflow || !write_all_before(stream, h.as_slice(), deadline) {
         return;
     }
     ws_loop(stream);
@@ -311,7 +313,7 @@ pub(crate) fn ws_loop(stream: &mut TcpStream) {
                 i += 1;
             }
             if v >> 63 != 0 {
-                ws_close(stream, 1009, b"too big");
+                ws_close(stream, 1009, b"too big", write_deadline());
                 return;
             }
             len = v;
@@ -320,7 +322,7 @@ pub(crate) fn ws_loop(stream: &mut TcpStream) {
         if !masked {
             // No mask key on the wire; drain the payload, then fail the frame.
             ws_drain(stream, len);
-            ws_close(stream, 1002, b"protocol");
+            ws_close(stream, 1002, b"protocol", write_deadline());
             return;
         }
         if !read_full(stream, &mut hdr[mkey_at..mkey_at + 4]) {
@@ -329,7 +331,7 @@ pub(crate) fn ws_loop(stream: &mut TcpStream) {
         let mask = [hdr[mkey_at], hdr[mkey_at + 1], hdr[mkey_at + 2], hdr[mkey_at + 3]];
         if rsv {
             ws_drain(stream, len);
-            ws_close(stream, 1002, b"protocol");
+            ws_close(stream, 1002, b"protocol", write_deadline());
             return;
         }
 
@@ -337,7 +339,7 @@ pub(crate) fn ws_loop(stream: &mut TcpStream) {
             // control frame: never fragmented, payload <= 125
             if !fin || len > 125 {
                 ws_drain(stream, len);
-                ws_close(stream, 1002, b"protocol");
+                ws_close(stream, 1002, b"protocol", write_deadline());
                 return;
             }
             let len = len as usize;
@@ -352,17 +354,17 @@ pub(crate) fn ws_loop(stream: &mut TcpStream) {
             }
             match opcode {
                 0x8 => {
-                    let _ = ws_send(stream, 0x8, &cbuf[..len]);
+                    let _ = ws_send(stream, 0x8, &cbuf[..len], write_deadline());
                     return;
                 }
                 0x9 => {
-                    if !ws_send(stream, 0xA, &cbuf[..len]) {
+                    if !ws_send(stream, 0xA, &cbuf[..len], write_deadline()) {
                         return;
                     }
                 }
                 0xA => {} // pong: noted, ignored
                 _ => {
-                    ws_close(stream, 1002, b"protocol");
+                    ws_close(stream, 1002, b"protocol", write_deadline());
                     return;
                 }
             }
@@ -372,19 +374,19 @@ pub(crate) fn ws_loop(stream: &mut TcpStream) {
         // data frame
         if opcode != 0x0 && opcode != 0x1 && opcode != 0x2 {
             ws_drain(stream, len);
-            ws_close(stream, 1002, b"protocol");
+            ws_close(stream, 1002, b"protocol", write_deadline());
             return;
         }
         if opcode == 0x0 {
             if frag_op == 0 {
                 ws_drain(stream, len);
-                ws_close(stream, 1002, b"protocol");
+                ws_close(stream, 1002, b"protocol", write_deadline());
                 return;
             }
         } else {
             if frag_op != 0 {
                 ws_drain(stream, len);
-                ws_close(stream, 1002, b"protocol");
+                ws_close(stream, 1002, b"protocol", write_deadline());
                 return;
             }
             frag_op = opcode;
@@ -392,7 +394,7 @@ pub(crate) fn ws_loop(stream: &mut TcpStream) {
         }
         if len > (WS_MSG_CAP - mlen) as u64 {
             ws_drain(stream, len);
-            ws_close(stream, 1009, b"too big");
+            ws_close(stream, 1009, b"too big", write_deadline());
             return;
         }
         let len = len as usize;
@@ -406,7 +408,7 @@ pub(crate) fn ws_loop(stream: &mut TcpStream) {
         }
         mlen += len;
         if fin {
-            if !ws_send(stream, frag_op, &msg[..mlen]) {
+            if !ws_send(stream, frag_op, &msg[..mlen], write_deadline()) {
                 return;
             }
             frag_op = 0;
