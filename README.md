@@ -56,10 +56,13 @@ HTTP/1.0 + 1.1 keep-alive with pipelined-byte shifting, `400`/`404`/`405`/
 `GET`/`HEAD /events` serves an **infinite** live feed per the HTML spec —
 `Content-Type: text/event-stream`, `Cache-Control: no-cache`, a
 `: zahttp event stream` comment plus `retry: 3000` preamble, then one
-`tick` event per second, forever: `id: N`, `event: tick`, `data: N`.
+event per second, forever, cycling `tick`, `tick`, `note`, `tick`, `bye`:
+`tick` carries `data: <id>`, `note` carries two data lines (`line one`,
+`line two`), `bye` carries `data: farewell`. The pattern is the original
+finite 5-event motif, now repeating forever — `note` and `bye` are back.
 Zero heap: every frame is assembled in one reused 128-byte stack buffer
 and written as its own chunk; the connection thread parks in
-`thread::sleep` between ticks, and the first failed write (client gone)
+`thread::sleep` between events, and the first failed write (client gone)
 is the only exit.
 
 - **Framing**: `Transfer-Encoding: chunked` on HTTP/1.1 (no terminating
