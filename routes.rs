@@ -1,11 +1,11 @@
 // zahttp module: routes (dispatch + small handlers) — zero deps, zero heap. See main.rs for the rules.
 
-use std::io::Write;
 use std::net::TcpStream;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use crate::alloc::{ALLOC_COUNT, REQUEST_COUNT};
-use crate::buf::{date_now, push_hex_u64, push_hex_usize, write2, write3, Out, RESP_HEAD_CAP};
+use crate::buf::{date_now, push_hex_u64, push_hex_usize, write2_before, write_all_before, Out, RESP_HEAD_CAP};
 use crate::http::{header, path_of, Request};
 use crate::multipart::serve_upload;
 
@@ -29,10 +29,15 @@ pub(crate) fn allow_for(path: &str) -> Option<&'static str> {
     })
 }
 
-pub(crate) fn send_options(stream: &mut TcpStream, req: &Request, keep_alive: bool) -> bool {
+pub(crate) fn send_options(
+    stream: &mut TcpStream,
+    req: &Request,
+    keep_alive: bool,
+    deadline: Instant,
+) -> bool {
     let allow = match allow_for(path_of(req.target)) {
         Some(a) => a,
-        None => return send(stream, 404, "text/plain", b"not found\n", keep_alive, true),
+        None => return send(stream, 404, "text/plain", b"not found\n", keep_alive, true, deadline),
     };
     let mut hbuf = [0u8; 512];
     let mut h = Out::new(&mut hbuf);
@@ -53,7 +58,7 @@ pub(crate) fn send_options(stream: &mut TcpStream, req: &Request, keep_alive: bo
     h.push_str("Content-Length: 0\r\nConnection: ");
     h.push_str(if keep_alive { "keep-alive" } else { "close" });
     h.push_str("\r\n\r\n");
-    !h.overflow && stream.write_all(h.as_slice()).is_ok()
+    !h.overflow && write_all_before(stream, h.as_slice(), deadline)
 }
 
 pub(crate) fn route(req: &Request, out: &mut Out) -> (u16, &'static str) {
@@ -157,6 +162,7 @@ pub(crate) fn send(
     body: &[u8],
     keep_alive: bool,
     with_body: bool,
+    deadline: Instant,
 ) -> bool {
     let mut hbuf = [0u8; RESP_HEAD_CAP];
     let mut h = Out::new(&mut hbuf);
@@ -180,14 +186,14 @@ pub(crate) fn send(
     }
     let payload: &[u8] = if with_body { body } else { &[] };
     // One writev for head+body: keeps the tiny body from stalling
-    // behind the header's delayed ACK (see buf::write2).
-    write2(stream, h.as_slice(), payload)
+    // behind the header's delayed ACK (see buf::write2_before).
+    write2_before(stream, h.as_slice(), payload, deadline)
 }
 
 // Stream a generated body with Transfer-Encoding: chunked. 64 chunks of
 // deterministic LCG hex, each framed as <hexlen>\r\n<payload>\r\n,
 // terminated by 0\r\n\r\n. No Content-Length, all fixed buffers.
-pub(crate) fn send_chunked(stream: &mut TcpStream, keep_alive: bool) -> bool {
+pub(crate) fn send_chunked(stream: &mut TcpStream, keep_alive: bool, deadline: Instant) -> bool {
     let mut hbuf = [0u8; RESP_HEAD_CAP];
     let mut h = Out::new(&mut hbuf);
     let mut date = [0u8; 29];
@@ -197,7 +203,7 @@ pub(crate) fn send_chunked(stream: &mut TcpStream, keep_alive: bool) -> bool {
     h.push_str("\r\nServer: zahttp/0.1\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: ");
     h.push_str(if keep_alive { "keep-alive" } else { "close" });
     h.push_str("\r\n\r\n");
-    if h.overflow || !stream.write_all(h.as_slice()).is_ok() {
+    if h.overflow || !write_all_before(stream, h.as_slice(), deadline) {
         return false;
     }
     let mut rng = 0x12345678u64;
@@ -231,10 +237,16 @@ pub(crate) fn send_chunked(stream: &mut TcpStream, keep_alive: bool) -> bool {
         if c.overflow {
             return false;
         }
-        if !write3(stream, c.as_slice(), payload, b"\r\n") {
+        if !write_all_before(stream, c.as_slice(), deadline) {
+            return false;
+        }
+        if !write_all_before(stream, payload, deadline) {
+            return false;
+        }
+        if !write_all_before(stream, b"\r\n", deadline) {
             return false;
         }
         i += 1;
     }
-    stream.write_all(b"0\r\n\r\n").is_ok()
+    write_all_before(stream, b"0\r\n\r\n", deadline)
 }
