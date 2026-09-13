@@ -5,7 +5,7 @@ use std::net::TcpStream;
 use std::sync::atomic::Ordering;
 
 use crate::alloc::{ALLOC_COUNT, REQUEST_COUNT};
-use crate::buf::{date_now, push_hex_u64, push_hex_usize, Out, RESP_HEAD_CAP};
+use crate::buf::{date_now, push_hex_u64, push_hex_usize, write2, Out, RESP_HEAD_CAP};
 use crate::http::{header, path_of, Request};
 use crate::multipart::serve_upload;
 
@@ -178,7 +178,9 @@ pub(crate) fn send(
         return false;
     }
     let payload: &[u8] = if with_body { body } else { &[] };
-    stream.write_all(h.as_slice()).is_ok() && stream.write_all(payload).is_ok()
+    // One writev for head+body: keeps the tiny body from stalling
+    // behind the header's delayed ACK (see buf::write2).
+    write2(stream, h.as_slice(), payload)
 }
 
 // Stream a generated body with Transfer-Encoding: chunked. 64 chunks of
