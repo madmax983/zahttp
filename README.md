@@ -231,6 +231,16 @@ reaper thread:
   1-byte-per-4.9-seconds slowloris loophole is closed: dribbles die at
   the deadline, not per read. Expiry closes the connection silently (a
   chunked timeout answers 400 like any other body error, then closes).
+- `WRITE_TIMEOUT_SECS = 5`: a **total** deadline for each finite
+  response's writes, armed when the response starts — every write is
+  bounded by the time left (`buf::write_all_before` /
+  `buf::write2_before` re-arm the socket timeout before each write, the
+  mirror of the read side). A client that never reads can't wedge a
+  thread in `send()` forever: expiry closes the connection silently
+  (answering 500 to a client that won't read would wedge the same way).
+  Infinite streams (`/events`, websocket) re-arm it per event/frame
+  instead — they have no total to bound, but a stalled write still
+  reaps a non-reading client within 5s.
 - `KEEPALIVE_REQUESTS = 100`: a connection serves at most 100 requests;
   the 100th is answered `Connection: close` even if the client asked to
   keep alive.
@@ -246,7 +256,15 @@ reaper thread:
   dribbles at 1 byte/sec are reaped at ~5s total, while pipelined
   healthy requests and full-speed bodies are unaffected. The old
   per-read-timeout binary fails the 3 dribble checks (dribbles linger),
-  proving the tests are real. The nagle regression and bench.py now
+  proving the tests are real. Write deadlines add 4 checks: a
+  non-reading client (4 KiB `tcp_wmem` fixture + 4 KiB receive buffer,
+  so the server's writev actually blocks) is reaped at ~5s while healthy
+  64 KiB reads and pipelined 64 KiB pairs are unaffected; the pre-dare
+  binary stays wedged, proving the test is real. Honest footnote: the
+  kernel absorbs any single write up to `tcp_wmem` max (4 MiB here) into
+  the send buffer, so a 64 KiB response only blocks once the backlog
+  exceeds it — the deadline is defense-in-depth that bites on infinite
+  streams once buffers fill. The nagle regression and bench.py now
   reconnect every 90 requests instead of assuming a connection lives
   forever. `/allocs` delta **0** across 80 keep-alive requests.
 
