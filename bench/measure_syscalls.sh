@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Deterministic syscall-count profile of zahttp's response-write path.
 #
-# Builds the binary exactly as documented (rustc --edition 2021 -O), runs it
-# under `strace -f -c` (needed because each connection is served on its own
+# Builds the binary exactly as documented (rustc -O -C debuginfo=0, the
+# module tree under main.rs picked up automatically), runs it under
+# `strace -f -c` (needed because each connection is served on its own
 # std::thread), drives bench/workload.py's fixed, seeded request mix against
 # it, and reports the strace -c summary. `write`, `sendto`, and `writev` are
 # the syscalls the response path can issue; their combined count is the
@@ -18,8 +19,8 @@ BIN="$(mktemp /tmp/zahttp_bench.XXXXXX)"
 STRACE_OUT="$(mktemp /tmp/zahttp_strace.XXXXXX)"
 trap 'rm -f "$BIN" "$STRACE_OUT"' EXIT
 
-echo "building: rustc --edition 2021 -O -o $BIN main.rs" >&2
-rustc --edition 2021 -O -o "$BIN" main.rs
+echo "building: rustc -O -C debuginfo=0 -o $BIN main.rs" >&2
+rustc -O -C debuginfo=0 -o "$BIN" main.rs
 
 nohup strace -f -c -o "$STRACE_OUT" -- "$BIN" >/tmp/zahttp_bench_server.log 2>&1 &
 STRACE_PID=$!
