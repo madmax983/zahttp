@@ -38,7 +38,9 @@ mod ws;
 
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+use std::time::Duration;
 
 use crate::alloc::REQUEST_COUNT;
 use crate::buf::{Out, BODY_CAP, READ_CAP, RESP_BODY_CAP};
@@ -50,13 +52,34 @@ use crate::ranges::send_ranges;
 use crate::routes::{route, send, send_chunked, send_options};
 use crate::sse::send_events;
 use crate::ws::ws_serve;
-use std::sync::atomic::Ordering;
+
+// ---- connection lifecycle -------------------------------------------------
+// nginx-style knobs, enforced with atomics and socket timeouts — no heap.
+//
+// KEEPALIVE_TIMEOUT_SECS bounds every read: an idle keep-alive gap, a
+// client that connects and sends nothing, and a slowloris dribble all
+// get reaped. (Caveat, documented not hidden: it is a per-read idle
+// timeout, so 1 byte per 4.9 seconds could linger; a total head/body
+// deadline is future work.)
+// KEEPALIVE_REQUESTS caps requests per connection; the last one is
+// answered `Connection: close`, nginx-style.
+// MAX_CONNECTIONS caps concurrent connections; over-cap connects get a
+// bare `503 Service Unavailable` with no request read, then close.
+const KEEPALIVE_TIMEOUT_SECS: u64 = 5;
+const KEEPALIVE_REQUESTS: u64 = 100;
+const MAX_CONNECTIONS: usize = 128;
+static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
 
 // ---- connection driver --------------------------------------------------
 
 fn serve(mut stream: TcpStream) {
     let mut buf = [0u8; READ_CAP];
     let mut n = 0usize;
+    let mut served = 0u64;
+    // Idle keep-alive gaps, pre-request silence, and slow dribbles all
+    // die here; a timed-out read lands in the existing `Err(_) => return`
+    // paths below and the connection closes cleanly.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(KEEPALIVE_TIMEOUT_SECS)));
     loop {
         // 1. read until the head is complete
         let head_end: usize = loop {
@@ -153,7 +176,10 @@ fn serve(mut stream: TcpStream) {
             Parse::Ready(r) => r,
         };
         req.body = body;
-        let ka = keep_alive(&req);
+        served += 1;
+        // The last request a connection may serve is answered
+        // `Connection: close`, even if the client asked to keep alive.
+        let ka = keep_alive(&req) && served < KEEPALIVE_REQUESTS;
         REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
         if req.method == "OPTIONS" {
             if !send_options(&mut stream, &req, ka) {
@@ -198,7 +224,20 @@ fn run() -> std::io::Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
-                thread::spawn(move || serve(s));
+                if ACTIVE_CONNS.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+                    ACTIVE_CONNS.fetch_sub(1, Ordering::SeqCst);
+                    // At capacity: a bare 503 with no request read, then close.
+                    let mut s = s;
+                    let _ = std::io::Write::write_all(
+                        &mut s,
+                        b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                    );
+                } else {
+                    thread::spawn(move || {
+                        serve(s);
+                        ACTIVE_CONNS.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
             }
             Err(e) => eprintln!("accept: {}", e),
         }
