@@ -16,6 +16,7 @@
 // Module map:
 //   alloc.rs     the counting global allocator (/allocs is the proof)
 //   buf.rs       Out, the fixed-buffer writer; HTTP dates; integer parsing
+//   dates.rs     HTTP-date parsing (RFC 7231 7.1.1.1) for conditionals
 //   http.rs      request parsing, framing, expectations, the send() writer
 //   routes.rs    INDEX, route(), OPTIONS, the small handlers
 //   sse.rs       GET /events — the infinite Server-Sent Events feed
@@ -26,6 +27,7 @@
 
 mod alloc;
 mod buf;
+mod dates;
 mod gzip;
 mod http;
 mod multipart;
