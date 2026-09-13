@@ -87,14 +87,17 @@ write to 1 removes another call from the remaining 97% of requests.
 
 ## 🔧 Change
 
-Added `write_all_vectored()` (std only, no new crate): loops
-`TcpStream::write_vectored` over an `&mut [IoSlice]`, advancing with the
-stable `IoSlice::advance_slices` on a short write, otherwise identical in
-behavior to chaining `write_all` calls — same bytes, same order, same
-error handling (a 0-byte write or a real I/O error still fails the
-response the same way the old code did). Applied at the five call sites
-identified above: `send()`, `send_range_full`, `send_gzip_full`,
-`send_range_single`, and the per-chunk loop in `send_chunked()`. No public
+Originally added `write_all_vectored()` (std only, no new crate) applied
+at all five call sites identified above. While this PR was open, upstream
+`main` independently landed the same fix as `write2()` in `buf.rs` —
+applied to `send()`, `send_range_full`, `send_gzip_full`,
+`send_range_single`, and `ws_send()` — so this branch merged that in and
+deferred to it rather than keep a parallel mechanism. The one call site
+upstream didn't cover, `send_chunked()`'s per-chunk loop (hex length
+line, payload, trailing CRLF — the single largest contributor at 194
+calls per response), now uses `write3()`, `write2`'s three-buffer twin,
+added to `buf.rs` in the same style. Same bytes, same order, same error
+handling as the original chained `write_all` calls either way. No public
 behavior, byte layout, or existing test/verification expectation changes.
 
 ## 📊 Measurement
