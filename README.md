@@ -88,7 +88,7 @@ else. Everything else is a module with one job:
 | Module         | Job                                                        |
 |----------------|------------------------------------------------------------|
 | `alloc.rs`     | the counting global allocator — the proof                   |
-| `buf.rs`       | `Out`, the fixed-buffer writer; HTTP dates; integer parsing |
+| `buf.rs`       | `Out`, the fixed-buffer writer; HTTP dates; integer parsing; `write2`, the one-`writev` response writer |
 | `http.rs`      | request parsing, framing, `Expect`, the `send()` writer     |
 | `routes.rs`    | `INDEX`, `route()`, `OPTIONS`, small handlers               |
 | `sse.rs`       | `GET /events` — the infinite Server-Sent Events feed        |
@@ -99,6 +99,33 @@ else. Everything else is a module with one job:
 
 The static gate runs over every module: no `String`, `Vec<`, `Box<`,
 `format!`, `vec!`, `unwrap()`, or `expect(` in authored code.
+
+## One writev per response (the dare, 2026-09-13)
+
+Benchmarking caught a real client-visible defect: sequential keep-alive
+`/health` showed p50 **41 ms** while the head arrived in under 1 ms.
+The body — 3 bytes — was waiting on the delayed ACK of the header
+segment, because the response left as two separate `write()` calls with
+Nagle enabled.
+
+The fix is `buf::write2()`: every non-streaming response (ordinary
+routes, `/bytes` full/single/gzip, WebSocket frames) now emits headers +
+body in a single `write_vectored()` call — one syscall, one segment —
+with a loop that advances across both slices on partial writes. The
+`IoSlice` pair lives on the stack, so the zero-allocation contract
+holds (`/allocs` delta 0 over 200 writev responses). `TCP_NODELAY` was
+deliberately not set: coalescing kills the artifact without changing
+congestion behavior for anyone else.
+
+Measured on the same box, same harness (`bench.py`, local `BENCHES.md`):
+
+- sequential `/health`: p50 41.0 ms → **0.023 ms** (24 → **33,039 req/s**)
+- pipelined `/bytes` (64 KiB): 12,234 → **28,376 req/s** (765 → 1,774 MiB/s)
+- 8-thread `/health`: 9,983 → **18,476 req/s**
+- strace: 5 requests → 5 `writev` calls, each taking both slices whole
+
+`nagle_test.py` is the regression: it fails on the old binary, passes
+on the new one. All 180 protocol checks stayed green.
 
 ## gzip content-encoding (the dare, 2026-09-13)
 
