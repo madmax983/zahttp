@@ -775,6 +775,7 @@ fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         206 => "Partial Content",
+        304 => "Not Modified",
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -1169,9 +1170,57 @@ fn send_range_multi(
     true
 }
 
+fn send_not_modified(stream: &mut TcpStream, keep_alive: bool) -> bool {
+    let mut hbuf = [0u8; 384];
+    let mut h = Out::new(&mut hbuf);
+    range_head_start(&mut h, 304);
+    h.push_str("ETag: ");
+    h.push_str(RANGE_ETAG);
+    h.push_str("\r\nConnection: ");
+    h.push_str(if keep_alive { "keep-alive" } else { "close" });
+    h.push_str("\r\n\r\n");
+    // 304 never carries a body, so no Content-Length is needed for framing.
+    !h.overflow && stream.write_all(h.as_slice()).is_ok()
+}
+
+// RFC 7232 2.3.2 + 3.3: If-None-Match uses the weak comparison function.
+// `*` matches any current representation; W/"..." matches weakly.
+fn etag_list_matches(value: &str, etag: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut start = 0usize;
+    loop {
+        let mut end = start;
+        while end < bytes.len() && bytes[end] != b',' {
+            end += 1;
+        }
+        let seg = trim(&bytes[start..end]);
+        if seg == b"*" {
+            return true;
+        }
+        let tag = match seg.strip_prefix(b"W/") {
+            Some(t) => t,
+            None => seg,
+        };
+        if tag == etag.as_bytes() {
+            return true;
+        }
+        if end == bytes.len() {
+            return false;
+        }
+        start = end + 1;
+    }
+}
+
 fn send_ranges(stream: &mut TcpStream, req: &Request, keep_alive: bool) -> bool {
     let total = RANGE_TOTAL as u64;
     let with_body = req.method == "GET"; // HEAD: headers only
+    // RFC 7232 3.3: a matching If-None-Match short-circuits everything,
+    // including Range, with 304 Not Modified.
+    if let Some(v) = header(req, "if-none-match") {
+        if etag_list_matches(v, RANGE_ETAG) {
+            return send_not_modified(stream, keep_alive);
+        }
+    }
     let mut rs = [(0u64, 0u64); MAX_RANGES];
     let nranges = match header(req, "range") {
         Some(v) => {
