@@ -46,6 +46,27 @@ HTTP/1.0 + 1.1 keep-alive with pipelined-byte shifting, `400`/`404`/`405`/
 `413`/`431`/`505` as appropriate, and a hand-rolled decimal printer
 (`push_u64`) because `format!` was disqualified.
 
+## OPTIONS (the dare, 2026-09-13)
+
+`OPTIONS` reports each resource's methods in `Allow` (RFC 7231 4.2.7):
+
+- `OPTIONS *` (asterisk-form) → `Allow: GET, HEAD, POST, OPTIONS`
+  for the server as a whole. The parser previously rejected `*` as a
+  target with 400; it now accepts it.
+- Per-resource `Allow` matches reality: `/`, `/health`, `/bytes` →
+  `GET, HEAD, OPTIONS`; `/metrics`, `/allocs`, `/time`, `/headers`,
+  `/chunked`, `/ws` → `GET, OPTIONS`; `/echo`, `/upload` →
+  `POST, OPTIONS`. Unknown paths → 404.
+- A CORS preflight (`Origin` + `Access-Control-Request-Method`) also
+  gets `Access-Control-Allow-Origin: *`,
+  `Access-Control-Allow-Methods`, and `Access-Control-Max-Age: 86400`.
+- Testing caught a real bug: the new OPTIONS branch was a separate
+  `if` instead of chained `else if`, so every OPTIONS request got
+  *two* responses (200 then a phantom 405), poisoning keep-alive.
+  Chained properly now.
+- Verification: 19 checks green. `/allocs` delta **0** across 25
+  OPTIONS on one connection.
+
 ## Conditional requests (the dare, 2026-09-13)
 
 `GET`/`HEAD /bytes` honors `If-None-Match` per RFC 7232:
