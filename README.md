@@ -89,6 +89,7 @@ else. Everything else is a module with one job:
 |----------------|------------------------------------------------------------|
 | `alloc.rs`     | the counting global allocator — the proof                   |
 | `buf.rs`       | `Out`, the fixed-buffer writer; HTTP dates; integer parsing; `write2`, the one-`writev` response writer |
+| `dates.rs`     | HTTP-date parsing (RFC 7231 7.1.1.1) for date conditionals   |
 | `http.rs`      | request parsing, framing, `Expect`, the `send()` writer     |
 | `routes.rs`    | `INDEX`, `route()`, `OPTIONS`, small handlers               |
 | `sse.rs`       | `GET /events` — the infinite Server-Sent Events feed        |
@@ -189,6 +190,31 @@ with a hand-rolled gzip unit — no crates, no allocator:
   stale etag → 200, match+Range → 304, header-name case-insensitivity,
   and a 304 followed by another request on the same keep-alive
   connection. `/allocs` delta **0** across 25 conditional 304s.
+
+## Date conditionals (the dare, 2026-09-13)
+
+`GET`/`HEAD /bytes` also speaks dates, per RFC 7232 3.3/3.4 — the
+sequel to the etag dare. The representation never changes, so
+`Last-Modified` is a fixed instant (`Sun, 13 Sep 2026 00:00:00 GMT`),
+advertised on every 200, 206, gzip 200, and 304:
+
+- `If-Modified-Since` → `304 Not Modified` when the representation is
+  no newer than the given date; ignored when `If-None-Match` is present
+  (RFC 7232 3.3 — the etag is the more accurate validator).
+- `If-Unmodified-Since` → `412 Precondition Failed` when the
+  representation is newer than the given date. Evaluated *before*
+  `If-None-Match` (RFC 7232 6 precedence), and both preconditions
+  short-circuit `Range`.
+- Unparsable dates are ignored, never a 400 — including impossible
+  days (`32 Sep`), bad times, and garbage.
+- The date parser (`dates.rs`) accepts all three HTTP-date formats the
+  RFC requires: IMF-fixdate, obsolete RFC 850 (with the >50-years
+  pivot rule for two-digit years), and asctime — all hand-rolled, all
+  stack-only, validated with checked arithmetic (2021-02-29 is
+  rejected, 2020-02-29 is not).
+- Verification: 27 checks green — all three formats, both directions,
+  precedence ordering, Range interaction, garbage tolerance. `/allocs`
+  delta **0** across 200 mixed conditional requests on one connection.
 
 ## Expect: 100-continue (the dare, 2026-09-13)
 
