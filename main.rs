@@ -696,7 +696,7 @@ fn find_double_crlf(hay: &[u8]) -> Option<usize> {
 
 // ---- routing ------------------------------------------------------------
 
-const INDEX: &str = "<!doctype html><html><head><title>zahttp</title><style>body{background:#0d0d0f;color:#c9a0ff;font-family:monospace;max-width:640px;margin:4rem auto;padding:0 1rem}h1{font-size:3rem}a{color:#7df9ff}</style></head><body><h1>zahttp &#x1f921;</h1><p>zero-dependency, zero-allocation HTTP/1.1. every byte on the stack.</p><ul><li><a href=\"/health\">/health</a></li><li><a href=\"/time\">/time</a></li><li><a href=\"/headers\">/headers</a></li><li><a href=\"/metrics\">/metrics</a></li><li><a href=\"/allocs\">/allocs</a></li><li><a href=\"/chunked\">/chunked</a> (chunked stream)</li><li><code>/ws</code> (websocket)</li><li><a href=\"/bytes\">/bytes</a> (range requests)</li><li><code>/upload</code> (multipart/form-data)</li></ul><p>POST a body to <code>/echo</code> and get it back. Chunked request bodies welcome.</p></body></html>";
+const INDEX: &str = "<!doctype html><html><head><title>zahttp</title><style>body{background:#0d0d0f;color:#c9a0ff;font-family:monospace;max-width:640px;margin:4rem auto;padding:0 1rem}h1{font-size:3rem}a{color:#7df9ff}</style></head><body><h1>zahttp &#x1f921;</h1><p>zero-dependency, zero-allocation HTTP/1.1. every byte on the stack.</p><ul><li><a href=\"/health\">/health</a></li><li><a href=\"/time\">/time</a></li><li><a href=\"/headers\">/headers</a></li><li><a href=\"/metrics\">/metrics</a></li><li><a href=\"/allocs\">/allocs</a></li><li><a href=\"/chunked\">/chunked</a> (chunked stream)</li><li><code>/ws</code> (websocket)</li><li><a href=\"/bytes\">/bytes</a> (ranges, conditionals, gzip)</li><li><code>/upload</code> (multipart/form-data)</li></ul><p>POST a body to <code>/echo</code> and get it back. Chunked request bodies welcome.</p></body></html>";
 
 // ---- OPTIONS (RFC 7231 4.2.7) -------------------------------------------
 // The methods each resource actually speaks; OPTIONS reports them in
@@ -1086,13 +1086,13 @@ fn range_head_end(h: &mut Out, content_length: u64, keep_alive: bool) {
     h.push_str("\r\n\r\n");
 }
 
-fn send_range_full(stream: &mut TcpStream, keep_alive: bool, with_body: bool) -> bool {
+fn send_range_full(stream: &mut TcpStream, keep_alive: bool, with_body: bool, etag: &str) -> bool {
     let mut hbuf = [0u8; 384];
     let mut h = Out::new(&mut hbuf);
     range_head_start(&mut h, 200);
     h.push_str("Content-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nETag: ");
-    h.push_str(RANGE_ETAG);
-    h.push_str("\r\n");
+    h.push_str(etag);
+    h.push_str("\r\nVary: Accept-Encoding\r\n");
     range_head_end(&mut h, RANGE_TOTAL as u64, keep_alive);
     if h.overflow {
         return false;
@@ -1106,19 +1106,43 @@ fn send_range_full(stream: &mut TcpStream, keep_alive: bool, with_body: bool) ->
     true
 }
 
+fn send_gzip_full(stream: &mut TcpStream, keep_alive: bool, with_body: bool) -> bool {
+    let gz = &*GZIP_BYTES;
+    let mut hbuf = [0u8; 384];
+    let mut h = Out::new(&mut hbuf);
+    range_head_start(&mut h, 200);
+    h.push_str(
+        "Content-Type: application/octet-stream\r\nContent-Encoding: gzip\r\nAccept-Ranges: bytes\r\nETag: ",
+    );
+    h.push_str(RANGE_ETAG_GZIP);
+    h.push_str("\r\nVary: Accept-Encoding\r\n");
+    range_head_end(&mut h, gz.0 as u64, keep_alive);
+    if h.overflow {
+        return false;
+    }
+    if !stream.write_all(h.as_slice()).is_ok() {
+        return false;
+    }
+    if with_body {
+        return stream.write_all(&gz.1[..gz.0]).is_ok();
+    }
+    true
+}
+
 fn send_range_single(
     stream: &mut TcpStream,
     keep_alive: bool,
     with_body: bool,
     first: u64,
     last: u64,
+    etag: &str,
 ) -> bool {
     let total = RANGE_TOTAL as u64;
     let mut hbuf = [0u8; 384];
     let mut h = Out::new(&mut hbuf);
     range_head_start(&mut h, 206);
     h.push_str("Content-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nETag: ");
-    h.push_str(RANGE_ETAG);
+    h.push_str(etag);
     h.push_str("\r\nContent-Range: bytes ");
     h.push_u64(first);
     h.push_str("-");
@@ -1146,6 +1170,7 @@ fn send_range_multi(
     keep_alive: bool,
     with_body: bool,
     rs: &[(u64, u64)],
+    etag: &str,
 ) -> bool {
     let total = RANGE_TOTAL as u64;
     let b = RANGE_BOUNDARY;
@@ -1160,9 +1185,10 @@ fn send_range_multi(
     h.push_str("Content-Type: multipart/byteranges; boundary=");
     h.push_str(b);
     h.push_str("\r\nAccept-Ranges: bytes\r\nETag: ");
-    h.push_str(RANGE_ETAG);
+    h.push_str(etag);
     h.push_str("\r\n");
     range_head_end(&mut h, content_length, keep_alive);
+    // multipart/byteranges never combines with gzip (Range wins), so no Vary.
     if h.overflow {
         return false;
     }
@@ -1214,13 +1240,13 @@ fn send_range_multi(
     true
 }
 
-fn send_not_modified(stream: &mut TcpStream, keep_alive: bool) -> bool {
+fn send_not_modified(stream: &mut TcpStream, keep_alive: bool, etag: &str) -> bool {
     let mut hbuf = [0u8; 384];
     let mut h = Out::new(&mut hbuf);
     range_head_start(&mut h, 304);
     h.push_str("ETag: ");
-    h.push_str(RANGE_ETAG);
-    h.push_str("\r\nConnection: ");
+    h.push_str(etag);
+    h.push_str("\r\nVary: Accept-Encoding\r\nConnection: ");
     h.push_str(if keep_alive { "keep-alive" } else { "close" });
     h.push_str("\r\n\r\n");
     // 304 never carries a body, so no Content-Length is needed for framing.
@@ -1258,11 +1284,15 @@ fn etag_list_matches(value: &str, etag: &str) -> bool {
 fn send_ranges(stream: &mut TcpStream, req: &Request, keep_alive: bool) -> bool {
     let total = RANGE_TOTAL as u64;
     let with_body = req.method == "GET"; // HEAD: headers only
+    // Content negotiation (RFC 7231 3.1.2.2): gzip only for full-body 200s,
+    // never combined with Range — like nginx, Range wins over encoding.
+    let gzip = header(req, "range").is_none() && accepts_gzip(req) && GZIP_BYTES.0 > 0;
+    let etag = if gzip { RANGE_ETAG_GZIP } else { RANGE_ETAG };
     // RFC 7232 3.3: a matching If-None-Match short-circuits everything,
     // including Range, with 304 Not Modified.
     if let Some(v) = header(req, "if-none-match") {
-        if etag_list_matches(v, RANGE_ETAG) {
-            return send_not_modified(stream, keep_alive);
+        if etag_list_matches(v, etag) {
+            return send_not_modified(stream, keep_alive, etag);
         }
     }
     let mut rs = [(0u64, 0u64); MAX_RANGES];
@@ -1293,11 +1323,15 @@ fn send_ranges(stream: &mut TcpStream, req: &Request, keep_alive: bool) -> bool 
         None => 0,
     };
     if nranges == 0 {
-        send_range_full(stream, keep_alive, with_body)
+        if gzip {
+            send_gzip_full(stream, keep_alive, with_body)
+        } else {
+            send_range_full(stream, keep_alive, with_body, etag)
+        }
     } else if nranges == 1 {
-        send_range_single(stream, keep_alive, with_body, rs[0].0, rs[0].1)
+        send_range_single(stream, keep_alive, with_body, rs[0].0, rs[0].1, etag)
     } else {
-        send_range_multi(stream, keep_alive, with_body, &rs[..nranges])
+        send_range_multi(stream, keep_alive, with_body, &rs[..nranges], etag)
     }
 }
 
@@ -1344,6 +1378,318 @@ fn expect_of(head: &[u8]) -> Expect {
 
 fn send_100(stream: &mut TcpStream) -> bool {
     stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").is_ok()
+}
+
+// ---- gzip content-coding (RFC 1952): the unit ---------------------------
+// Hand-rolled DEFLATE with fixed Huffman codes (RFC 1951 3.2.6): LZ77 with
+// 3-byte hash chains over a 32 KiB window, greedy matches, an LSB-first
+// bit writer, and a table-free CRC32. Everything over fixed stack buffers;
+// the 64 KiB body is compressed once into a LazyLock and every response
+// borrows slices of it.
+
+// worst case: 64 KiB of literals at 9 bits each + framing
+const GZIP_CAP: usize = 74752;
+const GZIP_MAX_IN: usize = 65536;
+
+struct BitW<'a> {
+    out: &'a mut [u8],
+    pos: usize,
+    acc: u32,   // pending bits, LSB-first
+    nbits: u32, // how many are pending
+    ok: bool,
+}
+
+impl<'a> BitW<'a> {
+    fn bits(&mut self, value: u32, count: u32) {
+        // every call site uses count <= 13, so acc never overflows u32
+        self.acc |= (value & ((1u32 << count) - 1)) << self.nbits;
+        self.nbits += count;
+        while self.nbits >= 8 {
+            if self.pos >= self.out.len() {
+                self.ok = false;
+                return;
+            }
+            self.out[self.pos] = self.acc as u8;
+            self.pos += 1;
+            self.acc >>= 8;
+            self.nbits -= 8;
+        }
+    }
+    fn flush(&mut self) {
+        if self.nbits > 0 {
+            if self.pos >= self.out.len() {
+                self.ok = false;
+                return;
+            }
+            self.out[self.pos] = self.acc as u8;
+            self.pos += 1;
+            self.acc = 0;
+            self.nbits = 0;
+        }
+    }
+}
+
+fn rev_bits(mut v: u32, mut n: u32) -> u32 {
+    let mut r = 0u32;
+    while n > 0 {
+        r = (r << 1) | (v & 1);
+        v >>= 1;
+        n -= 1;
+    }
+    r
+}
+
+// fixed Huffman literal/length code -> (code, bit length); codes are
+// MSB-first here and get bit-reversed at the call site for the wire
+fn lit_code(sym: u32) -> (u32, u32) {
+    if sym <= 143 {
+        (0x30 + sym, 8)
+    } else if sym <= 255 {
+        (0x190 + (sym - 144), 9)
+    } else if sym <= 279 {
+        (sym - 256, 7)
+    } else {
+        (0xC0 + (sym - 280), 8)
+    }
+}
+
+const LEN_BASE: [u16; 29] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83,
+    99, 115, 131, 163, 195, 227, 258,
+];
+const LEN_EXTRA: [u8; 29] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5,
+    5, 5, 0,
+];
+const DIST_BASE: [u16; 30] = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769,
+    1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+];
+const DIST_EXTRA: [u8; 30] = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11,
+    11, 12, 12, 13, 13,
+];
+
+// -> (symbol, extra bits, extra value)
+fn len_code(len: u32) -> (u32, u32, u32) {
+    let mut i = 0usize;
+    while i + 1 < LEN_BASE.len() && (LEN_BASE[i + 1] as u32) <= len {
+        i += 1;
+    }
+    (257 + i as u32, LEN_EXTRA[i] as u32, len - LEN_BASE[i] as u32)
+}
+
+fn dist_code(dist: u32) -> (u32, u32, u32) {
+    let mut i = 0usize;
+    while i + 1 < DIST_BASE.len() && (DIST_BASE[i + 1] as u32) <= dist {
+        i += 1;
+    }
+    (i as u32, DIST_EXTRA[i] as u32, dist - DIST_BASE[i] as u32)
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        let mut k = 0;
+        while k < 8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+            k += 1;
+        }
+    }
+    !crc
+}
+
+fn emit_lit(w: &mut BitW, sym: u32) {
+    let (c, n) = lit_code(sym);
+    w.bits(rev_bits(c, n), n);
+}
+
+fn hash3(b0: u8, b1: u8, b2: u8) -> usize {
+    (((b0 as u32) << 10) ^ ((b1 as u32) << 5) ^ (b2 as u32)) as usize & 8191
+}
+
+fn gzip_encode(input: &[u8], out: &mut [u8]) -> Option<usize> {
+    if input.len() > GZIP_MAX_IN || out.len() < 18 {
+        return None;
+    }
+    // gzip header: magic, deflate method, no flags, mtime 0, xfl 0, OS = unix
+    const HDR: [u8; 10] = [0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03];
+    out[..10].copy_from_slice(&HDR);
+    let mut w = BitW {
+        out: &mut out[10..],
+        pos: 0,
+        acc: 0,
+        nbits: 0,
+        ok: true,
+    };
+    w.bits(1, 1); // BFINAL
+    w.bits(0b01, 2); // BTYPE = fixed Huffman
+    const HN: usize = 8192;
+    let mut head = [0u32; HN]; // hash -> newest position + 1 (0 = none)
+    let mut prev = [0u32; GZIP_MAX_IN]; // position -> older position + 1
+    let n = input.len();
+    let mut i = 0usize;
+    while i < n {
+        let mut best_len = 0u32;
+        let mut best_dist = 0u32;
+        if i + 3 <= n {
+            let h = hash3(input[i], input[i + 1], input[i + 2]);
+            let mut cand = head[h];
+            let mut probes = 0u32;
+            let max_dist = i.min(32768) as u32;
+            while cand != 0 && probes < 128 {
+                probes += 1;
+                let p = (cand - 1) as usize;
+                let dist = (i - p) as u32;
+                if dist > max_dist {
+                    break; // chains run newest-first; all later are farther
+                }
+                let mut len = 0u32;
+                while len < 258 && i + (len as usize) < n && input[p + (len as usize)] == input[i + (len as usize)] {
+                    len += 1;
+                }
+                if len > best_len {
+                    best_len = len;
+                    best_dist = dist;
+                    if len == 258 {
+                        break;
+                    }
+                }
+                cand = prev[p];
+            }
+            prev[i] = head[h];
+            head[h] = (i + 1) as u32;
+        }
+        if best_len >= 3 {
+            let (sym, eb, ev) = len_code(best_len);
+            emit_lit(&mut w, sym);
+            if eb > 0 {
+                w.bits(ev, eb);
+            }
+            let (dsym, deb, dev) = dist_code(best_dist);
+            w.bits(rev_bits(dsym, 5), 5);
+            if deb > 0 {
+                w.bits(dev, deb);
+            }
+            // index the skipped positions so later matches can overlap
+            let mut k = 1usize;
+            while k < best_len as usize {
+                let j = i + k;
+                if j + 3 <= n {
+                    let h = hash3(input[j], input[j + 1], input[j + 2]);
+                    prev[j] = head[h];
+                    head[h] = (j + 1) as u32;
+                }
+                k += 1;
+            }
+            i += best_len as usize;
+        } else {
+            emit_lit(&mut w, input[i] as u32);
+            i += 1;
+        }
+        if !w.ok {
+            return None;
+        }
+    }
+    emit_lit(&mut w, 256); // end of block
+    w.flush();
+    if !w.ok {
+        return None;
+    }
+    let mut pos = 10 + w.pos;
+    if pos + 8 > out.len() {
+        return None;
+    }
+    out[pos..pos + 4].copy_from_slice(&crc32(input).to_le_bytes());
+    pos += 4;
+    out[pos..pos + 4].copy_from_slice(&(n as u32).to_le_bytes());
+    pos += 4;
+    Some(pos)
+}
+
+// Compressed once on first use; every gzip response borrows slices of it.
+static GZIP_BYTES: LazyLock<(usize, [u8; GZIP_CAP])> = LazyLock::new(|| {
+    let mut buf = [0u8; GZIP_CAP];
+    match gzip_encode(&RANGE_BODY[..], &mut buf) {
+        Some(n) => (n, buf),
+        None => (0, buf),
+    }
+});
+
+const RANGE_ETAG_GZIP: &str = "\"zahttp-bytes-v1+gzip\"";
+
+// true when the client will take a gzip content-coding (RFC 7231 5.3.4).
+// Comma-separated tokens; `gzip;q=0` opts out, `*` (with q>0) counts.
+fn q_is_zero(s: &[u8]) -> bool {
+    let mut it = s.iter();
+    match it.next() {
+        Some(b'0') => {}
+        _ => return false,
+    }
+    match it.next() {
+        None => return true,
+        Some(b'.') => {}
+        _ => return false,
+    }
+    it.all(|&c| c == b'0')
+}
+
+fn qvalue_zero(params: &[u8]) -> bool {
+    // params starts at the first ';' of the token (or is empty)
+    let mut i = 0usize;
+    while i < params.len() {
+        if params[i] == b';' {
+            let mut j = i + 1;
+            while j < params.len() && params[j] == b' ' {
+                j += 1;
+            }
+            if j + 1 < params.len() && (params[j] | 0x20) == b'q' && params[j + 1] == b'=' {
+                let mut k = j + 2;
+                while k < params.len() && params[k] == b' ' {
+                    k += 1;
+                }
+                let mut e = k;
+                while e < params.len() && params[e] != b';' && params[e] != b' ' {
+                    e += 1;
+                }
+                return q_is_zero(&params[k..e]);
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn accepts_gzip(req: &Request) -> bool {
+    let v = match header(req, "accept-encoding") {
+        Some(v) => v,
+        None => return false,
+    };
+    let bytes = v.as_bytes();
+    let mut start = 0usize;
+    loop {
+        let mut end = start;
+        while end < bytes.len() && bytes[end] != b',' {
+            end += 1;
+        }
+        let seg = trim(&bytes[start..end]);
+        let te = seg.iter().position(|&c| c == b';').unwrap_or(seg.len());
+        let tok = trim(&seg[..te]);
+        if tok.eq_ignore_ascii_case(b"gzip") || tok == b"*" {
+            if !qvalue_zero(&seg[te..]) {
+                return true;
+            }
+        }
+        if end == bytes.len() {
+            return false;
+        }
+        start = end + 1;
+    }
 }
 
 // ---- multipart/form-data parsing (RFC 7578): POST /upload --------------
