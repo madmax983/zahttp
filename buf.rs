@@ -200,5 +200,36 @@ pub(crate) fn write2(stream: &mut TcpStream, a: &[u8], b: &[u8]) -> bool {
     }
 }
 
+// write2's three-buffer twin, for send_chunked's <hexlen>\r\n + payload +
+// \r\n framing: the same Nagle reasoning applies per chunk, not just per
+// response, and it used to cost three write() calls per chunk instead
+// of one.
+pub(crate) fn write3(stream: &mut TcpStream, a: &[u8], b: &[u8], c: &[u8]) -> bool {
+    let mut a = a;
+    let mut b = b;
+    let mut c = c;
+    loop {
+        if a.is_empty() && b.is_empty() && c.is_empty() {
+            return true;
+        }
+        let bufs = [IoSlice::new(a), IoSlice::new(b), IoSlice::new(c)];
+        let from = usize::from(a.is_empty()) + usize::from(a.is_empty() && b.is_empty());
+        match stream.write_vectored(&bufs[from..]) {
+            Ok(0) => return false,
+            Ok(n) => {
+                let mut rem = n;
+                let take = rem.min(a.len());
+                a = &a[take..];
+                rem -= take;
+                let take = rem.min(b.len());
+                b = &b[take..];
+                rem -= take;
+                c = &c[rem.min(c.len())..];
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
 // Parse one byte-range-spec into an inclusive (first, last). False when
 // malformed or unsatisfiable against `total`.
