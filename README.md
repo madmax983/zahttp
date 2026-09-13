@@ -46,6 +46,25 @@ HTTP/1.0 + 1.1 keep-alive with pipelined-byte shifting, `400`/`404`/`405`/
 `413`/`431`/`505` as appropriate, and a hand-rolled decimal printer
 (`push_u64`) because `format!` was disqualified.
 
+## Expect: 100-continue (the dare, 2026-09-13)
+
+Clients may send `Expect: 100-continue` and wait for the interim
+`HTTP/1.1 100 Continue` before streaming the body (RFC 7231 5.1.1):
+
+- The expectation is scanned from the raw head *before* any body byte
+  is read, so a client that truly waits never hangs.
+- The interim response is sent only when a body is actually coming
+  (chunked, or `Content-Length > 0`); a bodyless `GET` with the header
+  just proceeds. Oversize bodies still fail fast with `413` and never
+  see a 100. Unknown expectations (`Expect: pizza`) fail fast with
+  `417 Expectation Failed`.
+- HTTP/1.0 requests ignore the header entirely (an interim 100 would
+  corrupt their framing).
+- Verification: 11 protocol checks green — including wait-then-send,
+  send-anyway pipelining, chunked bodies, and 100-continue on the
+  second request of a keep-alive connection. `/allocs` delta **0**
+  across 20 expect-uploads on one connection.
+
 ## Multipart form parsing (the dare, 2026-09-13)
 
 `POST /upload` with `Content-Type: multipart/form-data; boundary=...`
