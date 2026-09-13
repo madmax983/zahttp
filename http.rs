@@ -2,6 +2,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::time::Instant;
 
 use crate::buf::HDR_MAX;
 
@@ -258,6 +259,24 @@ pub(crate) fn parse_chunk_size(line: &[u8]) -> Result<usize, u16> {
 // Read one CRLF-terminated line from the stream into `line` (without the
 // CRLF). `buf[*pos..*n]` holds unconsumed bytes; `floor` is the lowest
 // index compaction may use, so the request head stays intact.
+// ---- deadline-bounded reads: BEAT THE DRIBBLE ---------------------------
+// Every serve() read goes through here. The socket timeout is re-armed to
+// the time left before each read, so a 1-byte-per-4.9s slowloris dies at
+// the total deadline instead of lingering forever. On expiry returns a
+// TimedOut error without reading; the caller closes the connection.
+pub(crate) fn read_before(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<usize> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+    }
+    let _ = stream.set_read_timeout(Some(remaining));
+    stream.read(buf)
+}
+
 pub(crate) fn read_line(
     stream: &mut TcpStream,
     buf: &mut [u8],
@@ -265,6 +284,7 @@ pub(crate) fn read_line(
     pos: &mut usize,
     n: &mut usize,
     line: &mut [u8],
+    deadline: Instant,
 ) -> Result<usize, u16> {
     let mut llen = 0usize;
     loop {
@@ -290,7 +310,7 @@ pub(crate) fn read_line(
             *n = floor + (*n - *pos);
             *pos = floor;
         }
-        match stream.read(&mut buf[*n..]) {
+        match read_before(stream, &mut buf[*n..], deadline) {
             Ok(0) => return Err(400),
             Ok(k) => *n += k,
             Err(_) => return Err(400),
@@ -306,6 +326,7 @@ pub(crate) fn expect_crlf(
     floor: usize,
     pos: &mut usize,
     n: &mut usize,
+    deadline: Instant,
 ) -> Result<bool, u16> {
     while *n - *pos < 2 {
         if *n == buf.len() {
@@ -313,7 +334,7 @@ pub(crate) fn expect_crlf(
             *n = floor + (*n - *pos);
             *pos = floor;
         }
-        match stream.read(&mut buf[*n..]) {
+        match read_before(stream, &mut buf[*n..], deadline) {
             Ok(0) => return Err(400),
             Ok(k) => *n += k,
             Err(_) => return Err(400),
@@ -338,16 +359,17 @@ pub(crate) fn decode_chunked(
     pos: &mut usize,
     n: &mut usize,
     out: &mut [u8],
+    deadline: Instant,
 ) -> Result<usize, u16> {
     let mut dlen = 0usize;
     let mut line = [0u8; 64];
     loop {
-        let llen = read_line(stream, buf, floor, pos, n, &mut line)?;
+        let llen = read_line(stream, buf, floor, pos, n, &mut line, deadline)?;
         let size = parse_chunk_size(&line[..llen])?;
         if size == 0 {
             // final chunk: swallow trailers until the empty line
             loop {
-                let tl = read_line(stream, buf, floor, pos, n, &mut line)?;
+                let tl = read_line(stream, buf, floor, pos, n, &mut line, deadline)?;
                 if tl == 0 {
                     break;
                 }
@@ -365,7 +387,7 @@ pub(crate) fn decode_chunked(
                     *n = floor;
                     *pos = floor;
                 }
-                match stream.read(&mut buf[*n..]) {
+                match read_before(stream, &mut buf[*n..], deadline) {
                     Ok(0) => return Err(400),
                     Ok(k) => *n += k,
                     Err(_) => return Err(400),
@@ -377,7 +399,7 @@ pub(crate) fn decode_chunked(
             dlen += avail;
             remaining -= avail;
         }
-        if !expect_crlf(stream, buf, floor, pos, n)? {
+        if !expect_crlf(stream, buf, floor, pos, n, deadline)? {
             return Err(400);
         }
     }
