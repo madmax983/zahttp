@@ -1,10 +1,10 @@
 // zahttp module: http (request parsing + framing) — zero deps, zero heap. See main.rs for the rules.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::TcpStream;
 use std::time::Instant;
 
-use crate::buf::HDR_MAX;
+use crate::buf::{write_all_before, HDR_MAX};
 
 // ---- request parsing: everything borrows from the read buffer ----------
 
@@ -460,6 +460,6 @@ pub(crate) fn expect_of(head: &[u8]) -> Expect {
     Expect::None
 }
 
-pub(crate) fn send_100(stream: &mut TcpStream) -> bool {
-    stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").is_ok()
+pub(crate) fn send_100(stream: &mut TcpStream, deadline: Instant) -> bool {
+    write_all_before(stream, b"HTTP/1.1 100 Continue\r\n\r\n", deadline)
 }
