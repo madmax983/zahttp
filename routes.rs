@@ -140,6 +140,7 @@ pub(crate) fn reason(status: u16) -> &'static str {
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        412 => "Precondition Failed",
         413 => "Content Too Large",
         416 => "Range Not Satisfiable",
         417 => "Expectation Failed",
