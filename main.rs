@@ -68,11 +68,22 @@ use crate::ws::ws_serve;
 // answered `Connection: close`, nginx-style.
 // MAX_CONNECTIONS caps concurrent connections; over-cap connects get a
 // bare `503 Service Unavailable` with no request read, then close.
+// WRITE_TIMEOUT_SECS is a TOTAL deadline for each finite response's
+// writes, armed when the response starts: a client that never reads
+// can't wedge a thread in send() forever. Infinite streams (/events,
+// websocket) re-arm it per event/frame instead — they have no total to
+// bound. Expiry closes silently: answering 500 to a client that won't
+// read would wedge the same way.
 const HEAD_TIMEOUT_SECS: u64 = 5;
 const BODY_TIMEOUT_SECS: u64 = 5;
+pub(crate) const WRITE_TIMEOUT_SECS: u64 = 5;
 const KEEPALIVE_REQUESTS: u64 = 100;
 const MAX_CONNECTIONS: usize = 128;
 static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn write_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(WRITE_TIMEOUT_SECS)
+}
 
 // ---- connection driver --------------------------------------------------
 
@@ -92,7 +103,7 @@ fn serve(mut stream: TcpStream) {
                 break p;
             }
             if n == buf.len() {
-                send(&mut stream, 431, "text/plain", b"head too large\n", false, true);
+                send(&mut stream, 431, "text/plain", b"head too large\n", false, true, write_deadline());
                 return;
             }
             match read_before(&mut stream, &mut buf[n..], head_deadline) {
@@ -109,14 +120,7 @@ fn serve(mut stream: TcpStream) {
             let head = &buf[..head_end + 4];
             is_chunked(head)
         };
-        // Deferred initialization: zero-filling BODY_CAP bytes here,
-        // unconditionally, would cost every request a memset even though
-        // `decoded` is only ever written to (and read from) inside the
-        // `chunked` branch below. Declaring it without a value and
-        // assigning `[0u8; BODY_CAP]` only on that branch means the
-        // memset is emitted solely where it is reachable, so a
-        // content-length body (the common case) never pays for it.
-        let mut decoded: [u8; BODY_CAP];
+        let mut decoded = [0u8; BODY_CAP];
         let body: &[u8];
         let consumed: usize;
         // 2b. expectations (RFC 7231 5.1.1): answered before any body byte
@@ -124,23 +128,22 @@ fn serve(mut stream: TcpStream) {
         // is only ever sent when a body is actually coming.
         let expect = expect_of(&buf[..head_end + 4]);
         if expect == Expect::Other {
-            send(&mut stream, 417, "text/plain", b"expectation failed\n", false, true);
+            send(&mut stream, 417, "text/plain", b"expectation failed\n", false, true, write_deadline());
             return;
         }
         // 2c. total body deadline, armed once the head is in: content-
         // length and chunked dribbles both die here.
         let body_deadline = Instant::now() + Duration::from_secs(BODY_TIMEOUT_SECS);
         if chunked {
-            if expect == Expect::Continue && !send_100(&mut stream) {
+            if expect == Expect::Continue && !send_100(&mut stream, write_deadline()) {
                 return;
             }
-            decoded = [0u8; BODY_CAP];
             let mut pos = body_start;
             let dlen = match decode_chunked(&mut stream, &mut buf, body_start, &mut pos, &mut n, &mut decoded, body_deadline) {
                 Ok(l) => l,
                 Err(s) => {
                     let msg: &[u8] = if s == 413 { b"body too large\n" } else { b"bad request\n" };
-                    send(&mut stream, s, "text/plain", msg, false, true);
+                    send(&mut stream, s, "text/plain", msg, false, true, write_deadline());
                     return;
                 }
             };
@@ -152,21 +155,21 @@ fn serve(mut stream: TcpStream) {
                 match content_length_of(head) {
                     Ok(c) => c,
                     Err(s) => {
-                        send(&mut stream, s, "text/plain", b"bad request\n", false, true);
+                        send(&mut stream, s, "text/plain", b"bad request\n", false, true, write_deadline());
                         return;
                     }
                 }
             };
             if content_length > BODY_CAP {
-                send(&mut stream, 413, "text/plain", b"body too large\n", false, true);
+                send(&mut stream, 413, "text/plain", b"body too large\n", false, true, write_deadline());
                 return;
             }
-            if expect == Expect::Continue && content_length > 0 && !send_100(&mut stream) {
+            if expect == Expect::Continue && content_length > 0 && !send_100(&mut stream, write_deadline()) {
                 return;
             }
             while n - body_start < content_length {
                 if n == buf.len() {
-                    send(&mut stream, 413, "text/plain", b"body too large\n", false, true);
+                    send(&mut stream, 413, "text/plain", b"body too large\n", false, true, write_deadline());
                     return;
                 }
                 match read_before(&mut stream, &mut buf[n..], body_deadline) {
@@ -182,38 +185,42 @@ fn serve(mut stream: TcpStream) {
         let head = &buf[..head_end + 4];
         let mut req = match parse_head(head) {
             Parse::NeedMore | Parse::Fail(400) => {
-                send(&mut stream, 400, "text/plain", b"bad request\n", false, true);
+                send(&mut stream, 400, "text/plain", b"bad request\n", false, true, write_deadline());
                 return;
             }
             Parse::Fail(s) => {
-                send(&mut stream, s, "text/plain", b"bad request\n", false, true);
+                send(&mut stream, s, "text/plain", b"bad request\n", false, true, write_deadline());
                 return;
             }
             Parse::Ready(r) => r,
         };
         req.body = body;
         served += 1;
+        // Total write deadline for this response, armed now that the
+        // request is fully in. Streams re-arm it per event/frame inside
+        // their own loops.
+        let wdeadline = write_deadline();
         // The last request a connection may serve is answered
         // `Connection: close`, even if the client asked to keep alive.
         let ka = keep_alive(&req) && served < KEEPALIVE_REQUESTS;
         REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
         if req.method == "OPTIONS" {
-            if !send_options(&mut stream, &req, ka) {
+            if !send_options(&mut stream, &req, ka, wdeadline) {
                 return;
             }
         } else if req.method == "GET" && path_of(req.target) == "/ws" {
-            ws_serve(&mut stream, &req);
+            ws_serve(&mut stream, &req, wdeadline);
             return;
         } else if (req.method == "GET" || req.method == "HEAD") && path_of(req.target) == "/bytes" {
-            if !send_ranges(&mut stream, &req, ka) {
+            if !send_ranges(&mut stream, &req, ka, wdeadline) {
                 return;
             }
         } else if req.method == "GET" && path_of(req.target) == "/chunked" {
-            if !send_chunked(&mut stream, ka) {
+            if !send_chunked(&mut stream, ka, wdeadline) {
                 return;
             }
         } else if (req.method == "GET" || req.method == "HEAD") && path_of(req.target) == "/events" {
-            if !send_events(&mut stream, &req, ka) {
+            if !send_events(&mut stream, &req, ka, wdeadline) {
                 return;
             }
         } else {
@@ -221,7 +228,7 @@ fn serve(mut stream: TcpStream) {
             let mut out = Out::new(&mut bbuf);
             let (status, content_type) = route(&req, &mut out);
             let with_body = req.method != "HEAD" && !out.overflow;
-            if !send(&mut stream, status, content_type, out.as_slice(), ka, with_body) {
+            if !send(&mut stream, status, content_type, out.as_slice(), ka, with_body, wdeadline) {
                 return;
             }
         }
@@ -244,9 +251,10 @@ fn run() -> std::io::Result<()> {
                     ACTIVE_CONNS.fetch_sub(1, Ordering::SeqCst);
                     // At capacity: a bare 503 with no request read, then close.
                     let mut s = s;
-                    let _ = std::io::Write::write_all(
+                    let _ = crate::buf::write_all_before(
                         &mut s,
                         b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                        write_deadline(),
                     );
                 } else {
                     thread::spawn(move || {
