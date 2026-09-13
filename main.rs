@@ -368,7 +368,9 @@ fn parse_head(head: &[u8]) -> Parse<'_> {
         _ => return Parse::Fail(400),
     };
     let target = match core::str::from_utf8(target) {
-        Ok(s) if s.starts_with('/') => s,
+        // "*" is the asterisk-form target, only meaningful for OPTIONS
+        // (RFC 7230 5.3.4); anything else must be an origin-form path.
+        Ok(s) if s.starts_with('/') || s == "*" => s,
         _ => return Parse::Fail(400),
     };
     let mut headers: [Option<Header>; HDR_MAX] = [None; HDR_MAX];
@@ -695,6 +697,48 @@ fn find_double_crlf(hay: &[u8]) -> Option<usize> {
 // ---- routing ------------------------------------------------------------
 
 const INDEX: &str = "<!doctype html><html><head><title>zahttp</title><style>body{background:#0d0d0f;color:#c9a0ff;font-family:monospace;max-width:640px;margin:4rem auto;padding:0 1rem}h1{font-size:3rem}a{color:#7df9ff}</style></head><body><h1>zahttp &#x1f921;</h1><p>zero-dependency, zero-allocation HTTP/1.1. every byte on the stack.</p><ul><li><a href=\"/health\">/health</a></li><li><a href=\"/time\">/time</a></li><li><a href=\"/headers\">/headers</a></li><li><a href=\"/metrics\">/metrics</a></li><li><a href=\"/allocs\">/allocs</a></li><li><a href=\"/chunked\">/chunked</a> (chunked stream)</li><li><code>/ws</code> (websocket)</li><li><a href=\"/bytes\">/bytes</a> (range requests)</li><li><code>/upload</code> (multipart/form-data)</li></ul><p>POST a body to <code>/echo</code> and get it back. Chunked request bodies welcome.</p></body></html>";
+
+// ---- OPTIONS (RFC 7231 4.2.7) -------------------------------------------
+// The methods each resource actually speaks; OPTIONS reports them in
+// Allow. `*` asks about the server as a whole.
+fn allow_for(path: &str) -> Option<&'static str> {
+    Some(match path {
+        "*" => "GET, HEAD, POST, OPTIONS",
+        "/" | "/health" => "GET, HEAD, OPTIONS",
+        "/bytes" => "GET, HEAD, OPTIONS",
+        "/metrics" | "/allocs" | "/time" | "/headers" => "GET, OPTIONS",
+        "/echo" | "/upload" => "POST, OPTIONS",
+        "/chunked" | "/ws" => "GET, OPTIONS",
+        _ => return None,
+    })
+}
+
+fn send_options(stream: &mut TcpStream, req: &Request, keep_alive: bool) -> bool {
+    let allow = match allow_for(path_of(req.target)) {
+        Some(a) => a,
+        None => return send(stream, 404, "text/plain", b"not found\n", keep_alive, true),
+    };
+    let mut hbuf = [0u8; 512];
+    let mut h = Out::new(&mut hbuf);
+    let mut date = [0u8; 29];
+    date_now(&mut date);
+    h.push_str("HTTP/1.1 200 OK\r\nDate: ");
+    h.push(&date);
+    h.push_str("\r\nServer: zahttp/0.1\r\nAllow: ");
+    h.push_str(allow);
+    h.push_str("\r\n");
+    // A CORS preflight (Origin + Access-Control-Request-Method) gets the
+    // CORS answer headers too; that is what OPTIONS is for in practice.
+    if header(req, "origin").is_some() && header(req, "access-control-request-method").is_some() {
+        h.push_str("Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: ");
+        h.push_str(allow);
+        h.push_str("\r\nAccess-Control-Max-Age: 86400\r\n");
+    }
+    h.push_str("Content-Length: 0\r\nConnection: ");
+    h.push_str(if keep_alive { "keep-alive" } else { "close" });
+    h.push_str("\r\n\r\n");
+    !h.overflow && stream.write_all(h.as_slice()).is_ok()
+}
 
 fn route(req: &Request, out: &mut Out) -> (u16, &'static str) {
     let path = path_of(req.target);
@@ -1927,11 +1971,14 @@ fn serve(mut stream: TcpStream) {
         req.body = body;
         let ka = keep_alive(&req);
         REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
-        if req.method == "GET" && path_of(req.target) == "/ws" {
+        if req.method == "OPTIONS" {
+            if !send_options(&mut stream, &req, ka) {
+                return;
+            }
+        } else if req.method == "GET" && path_of(req.target) == "/ws" {
             ws_serve(&mut stream, &req);
             return;
-        }
-        if (req.method == "GET" || req.method == "HEAD") && path_of(req.target) == "/bytes" {
+        } else if (req.method == "GET" || req.method == "HEAD") && path_of(req.target) == "/bytes" {
             if !send_ranges(&mut stream, &req, ka) {
                 return;
             }
