@@ -219,29 +219,36 @@ advertised on every 200, 206, gzip 200, and 304:
 ## Connection lifecycle (the dare, 2026-09-13)
 
 Three nginx-style knobs bound how long a client may hold the server,
-all enforced with atomics and socket timeouts — no heap, no reaper
-thread:
+all enforced with atomics and deadline-bounded reads — no heap, no
+reaper thread:
 
-- `KEEPALIVE_TIMEOUT_SECS = 5`: every read gets a 5-second idle
-  deadline. A silent connect-and-send-nothing, an idle keep-alive gap,
-  and a slowloris dribble are all reaped the same way — the timed-out
-  read falls into the existing error paths and the connection closes
-  cleanly. Honest caveat: it is a *per-read* timeout, so 1 byte per 4.9
-  seconds could linger; a total head/body deadline is future work.
+- `HEAD_TIMEOUT_SECS = 5`: a **total** deadline for the request head,
+  re-armed per request. A silent connect-and-send-nothing, an idle
+  keep-alive gap, and a slow header dribble are all reaped the same way.
+- `BODY_TIMEOUT_SECS = 5`: a **total** deadline for the request body
+  (content-length and chunked). Every read is bounded by the time left —
+  the socket timeout is re-armed before each read — so the old
+  1-byte-per-4.9-seconds slowloris loophole is closed: dribbles die at
+  the deadline, not per read. Expiry closes the connection silently (a
+  chunked timeout answers 400 like any other body error, then closes).
 - `KEEPALIVE_REQUESTS = 100`: a connection serves at most 100 requests;
   the 100th is answered `Connection: close` even if the client asked to
   keep alive.
 - `MAX_CONNECTIONS = 128`: an atomic counter in the accept loop caps
   concurrent connections; over-cap connects get a bare `503 Service
   Unavailable` with no request read, then close.
-- Upgraded websockets are exempt from the read timeout — an upgraded
+- Upgraded websockets are exempt from the read deadlines — an upgraded
   connection is no longer HTTP keep-alive, so a quiet websocket must
   not be reaped as idle HTTP. (SSE never reads, so it is unaffected.)
-- Verification: 7 checks green — 1–99 keep-alive with close on the
-  100th, idle-gap reaping, silent-connection reaping, 503 at 129
-  concurrent. The nagle regression needed one honest update: it now
-  reconnects every 90 requests instead of assuming a connection lives
-  forever. `/allocs` delta **0** across 90 keep-alive requests.
+- Verification: 7 lifecycle checks green (1–99 keep-alive with close on
+  the 100th, idle-gap reaping, silent-connection reaping, 503 at 129
+  concurrent) plus 5 read-timeout checks: slow header, body, and chunked
+  dribbles at 1 byte/sec are reaped at ~5s total, while pipelined
+  healthy requests and full-speed bodies are unaffected. The old
+  per-read-timeout binary fails the 3 dribble checks (dribbles linger),
+  proving the tests are real. The nagle regression and bench.py now
+  reconnect every 90 requests instead of assuming a connection lives
+  forever. `/allocs` delta **0** across 80 keep-alive requests.
 
 ## Expect: 100-continue (the dare, 2026-09-13)
 
