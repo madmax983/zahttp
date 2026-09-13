@@ -46,6 +46,23 @@ HTTP/1.0 + 1.1 keep-alive with pipelined-byte shifting, `400`/`404`/`405`/
 `413`/`431`/`505` as appropriate, and a hand-rolled decimal printer
 (`push_u64`) because `format!` was disqualified.
 
+## Conditional requests (the dare, 2026-09-13)
+
+`GET`/`HEAD /bytes` honors `If-None-Match` per RFC 7232:
+
+- A matching validator short-circuits everything — including `Range`
+  — with `304 Not Modified`, ETag echoed, no body, no `Content-Length`
+  (a 304 never carries a body, so framing stays unambiguous and
+  keep-alive survives).
+- Weak comparison: `W/"zahttp-bytes-v1"` matches; `*` matches any
+  current representation; comma-separated lists are scanned with a
+  plain index loop (no allocation).
+- Routes without an ETag (`/health`, etc.) simply ignore the header.
+- Verification: 13 checks green — exact/weak/wildcard/list matches,
+  stale etag → 200, match+Range → 304, header-name case-insensitivity,
+  and a 304 followed by another request on the same keep-alive
+  connection. `/allocs` delta **0** across 25 conditional 304s.
+
 ## Expect: 100-continue (the dare, 2026-09-13)
 
 Clients may send `Expect: 100-continue` and wait for the interim
