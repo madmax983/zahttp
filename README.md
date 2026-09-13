@@ -40,11 +40,35 @@ The ~30 baseline is process startup and per-connection thread spawn —
 | `/allocs`    | GET    | heap allocation counter (the proof)                |
 | `/bytes`     | GET/HEAD | 64 KiB deterministic body with RFC 7233 ranges, `If-None-Match`, and `Accept-Encoding: gzip` (see below) |
 | `/upload`    | POST   | parses `multipart/form-data` bodies, returns a part summary (see below) |
+| `/events`    | GET/HEAD | Server-Sent Events stream: 5 deterministic events, `Last-Event-ID` resume (see below) |
 
 Also: proper `Date`/`Server`/`Content-Length`/`Connection` headers,
 HTTP/1.0 + 1.1 keep-alive with pipelined-byte shifting, `400`/`404`/`405`/
 `413`/`431`/`505` as appropriate, and a hand-rolled decimal printer
 (`push_u64`) because `format!` was disqualified.
+
+## Server-Sent Events (the dare, 2026-09-13)
+
+`GET`/`HEAD /events` serves a deterministic 5-event stream per the HTML
+spec — `Content-Type: text/event-stream`, `Cache-Control: no-cache`, a
+`: zahttp event stream` comment plus `retry: 3000` preamble, three `tick`
+events, one multi-line `note` event, and a closing `bye` event. Zero heap:
+every frame is assembled in one reused 128-byte stack buffer and written
+as its own chunk.
+
+- **Framing**: `Transfer-Encoding: chunked` on HTTP/1.1 (terminating
+  zero chunk, connection stays alive for pipelining); close-delimited on
+  HTTP/1.0 — the server forces `Connection: close` there since a
+  body with no length and no chunks can't persist.
+- `Last-Event-ID` resumes the stream after that id (absent or garbage →
+  0; `>= 5` → preamble only). `HEAD` returns headers only with no
+  `Transfer-Encoding` promised.
+- Verification: 39 protocol checks green — exact SSE field/blank-line
+  framing, multi-line `data:` reconstruction, nine `Last-Event-ID`
+  cases (absent, garbage, empty, 0, 2, 4, 5, 99, u64::MAX), chunk
+  boundaries, HEAD, pipelining after a completed stream, HTTP/1.0
+  close behavior, `OPTIONS`/`Allow`, `POST` → 405 — and `/allocs`
+  moved **0** across 25 streams on one keep-alive connection.
 
 ## gzip content-encoding (the dare, 2026-09-13)
 
@@ -78,8 +102,8 @@ with a hand-rolled gzip unit — no crates, no allocator:
 - `OPTIONS *` (asterisk-form) → `Allow: GET, HEAD, POST, OPTIONS`
   for the server as a whole. The parser previously rejected `*` as a
   target with 400; it now accepts it.
-- Per-resource `Allow` matches reality: `/`, `/health`, `/bytes` →
-  `GET, HEAD, OPTIONS`; `/metrics`, `/allocs`, `/time`, `/headers`,
+- Per-resource `Allow` matches reality: `/`, `/health`, `/bytes`,
+  `/events` → `GET, HEAD, OPTIONS`; `/metrics`, `/allocs`, `/time`, `/headers`,
   `/chunked`, `/ws` → `GET, OPTIONS`; `/echo`, `/upload` →
   `POST, OPTIONS`. Unknown paths → 404.
 - A CORS preflight (`Origin` + `Access-Control-Request-Method`) also
