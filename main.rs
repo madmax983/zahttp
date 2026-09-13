@@ -696,7 +696,7 @@ fn find_double_crlf(hay: &[u8]) -> Option<usize> {
 
 // ---- routing ------------------------------------------------------------
 
-const INDEX: &str = "<!doctype html><html><head><title>zahttp</title><style>body{background:#0d0d0f;color:#c9a0ff;font-family:monospace;max-width:640px;margin:4rem auto;padding:0 1rem}h1{font-size:3rem}a{color:#7df9ff}</style></head><body><h1>zahttp &#x1f921;</h1><p>zero-dependency, zero-allocation HTTP/1.1. every byte on the stack.</p><ul><li><a href=\"/health\">/health</a></li><li><a href=\"/time\">/time</a></li><li><a href=\"/headers\">/headers</a></li><li><a href=\"/metrics\">/metrics</a></li><li><a href=\"/allocs\">/allocs</a></li><li><a href=\"/chunked\">/chunked</a> (chunked stream)</li><li><code>/ws</code> (websocket)</li><li><a href=\"/bytes\">/bytes</a> (ranges, conditionals, gzip)</li><li><code>/upload</code> (multipart/form-data)</li></ul><p>POST a body to <code>/echo</code> and get it back. Chunked request bodies welcome.</p></body></html>";
+const INDEX: &str = "<!doctype html><html><head><title>zahttp</title><style>body{background:#0d0d0f;color:#c9a0ff;font-family:monospace;max-width:640px;margin:4rem auto;padding:0 1rem}h1{font-size:3rem}a{color:#7df9ff}</style></head><body><h1>zahttp &#x1f921;</h1><p>zero-dependency, zero-allocation HTTP/1.1. every byte on the stack.</p><ul><li><a href=\"/health\">/health</a></li><li><a href=\"/time\">/time</a></li><li><a href=\"/headers\">/headers</a></li><li><a href=\"/metrics\">/metrics</a></li><li><a href=\"/allocs\">/allocs</a></li><li><a href=\"/chunked\">/chunked</a> (chunked stream)</li><li><code>/ws</code> (websocket)</li><li><a href=\"/bytes\">/bytes</a> (ranges, conditionals, gzip)</li><li><code>/upload</code> (multipart/form-data)</li><li><a href=\"/events\">/events</a> (server-sent events)</li></ul><p>POST a body to <code>/echo</code> and get it back. Chunked request bodies welcome.</p></body></html>";
 
 // ---- OPTIONS (RFC 7231 4.2.7) -------------------------------------------
 // The methods each resource actually speaks; OPTIONS reports them in
@@ -709,6 +709,7 @@ fn allow_for(path: &str) -> Option<&'static str> {
         "/metrics" | "/allocs" | "/time" | "/headers" => "GET, OPTIONS",
         "/echo" | "/upload" => "POST, OPTIONS",
         "/chunked" | "/ws" => "GET, OPTIONS",
+        "/events" => "GET, HEAD, OPTIONS",
         _ => return None,
     })
 }
@@ -752,7 +753,8 @@ fn route(req: &Request, out: &mut Out) -> (u16, &'static str) {
         || path == "/chunked"
         || path == "/ws"
         || path == "/bytes"
-        || path == "/upload";
+        || path == "/upload"
+        || path == "/events";
     match (req.method, path) {
         ("GET", "/") | ("HEAD", "/") => {
             out.push_str(INDEX);
@@ -923,6 +925,111 @@ fn send_chunked(stream: &mut TcpStream, keep_alive: bool) -> bool {
         i += 1;
     }
     stream.write_all(b"0\r\n\r\n").is_ok()
+}
+
+// ---- Server-Sent Events (HTML spec): GET /events -----------------------
+// A deterministic 5-event stream. `Content-Type: text/event-stream`,
+// `Cache-Control: no-cache`, chunked on HTTP/1.1, close-delimited on
+// HTTP/1.0. `Last-Event-ID` resumes the stream after that id (garbage or
+// absent means 0). Frames use LF line endings per the SSE spec; every
+// frame is built in one reused stack buffer — no allocator anywhere.
+const SSE_COUNT: u64 = 5;
+const SSE_PREAMBLE: &[u8] = b": zahttp event stream\nretry: 3000\n\n";
+
+fn sse_event(id: u64, o: &mut Out) {
+    o.push_str("id: ");
+    o.push_u64(id);
+    o.push_str("\nevent: ");
+    match id {
+        1 | 2 | 4 => {
+            o.push_str("tick\ndata: ");
+            o.push_u64(id);
+            o.push_str("\n");
+        }
+        3 => o.push_str("note\ndata: line one\ndata: line two\n"),
+        _ => o.push_str("bye\ndata: farewell\n"),
+    }
+    o.push_str("\n");
+}
+
+fn write_sse_chunk(stream: &mut TcpStream, payload: &[u8]) -> bool {
+    let mut cbuf = [0u8; 24];
+    let mut c = Out::new(&mut cbuf);
+    push_hex_usize(&mut c, payload.len());
+    c.push_str("\r\n");
+    if c.overflow {
+        return false;
+    }
+    stream.write_all(c.as_slice()).is_ok()
+        && stream.write_all(payload).is_ok()
+        && stream.write_all(b"\r\n").is_ok()
+}
+
+fn send_events(stream: &mut TcpStream, req: &Request, keep_alive: bool) -> bool {
+    let with_body = req.method == "GET"; // HEAD: headers only
+    let http11 = req.version == 1;
+    // HTTP/1.0 is close-delimited: no Content-Length, no chunked framing,
+    // so the connection must close even if the client asked for keep-alive.
+    let alive = http11 && keep_alive;
+    let mut hbuf = [0u8; RESP_HEAD_CAP];
+    let mut h = Out::new(&mut hbuf);
+    let mut date = [0u8; 29];
+    date_now(&mut date);
+    h.push_str("HTTP/1.1 200 OK\r\nDate: ");
+    h.push(&date);
+    h.push_str("\r\nServer: zahttp/0.1\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n");
+    if with_body && http11 {
+        // HEAD carries no body, so it must not promise chunked framing.
+        h.push_str("Transfer-Encoding: chunked\r\n");
+    }
+    h.push_str("Connection: ");
+    h.push_str(if alive { "keep-alive" } else { "close" });
+    h.push_str("\r\n\r\n");
+    if h.overflow || !stream.write_all(h.as_slice()).is_ok() {
+        return false;
+    }
+    if !with_body {
+        return alive;
+    }
+    let start = match header(req, "last-event-id") {
+        Some(v) => match parse_u64b(v.trim().as_bytes()) {
+            Some(n) => n,
+            None => 0,
+        },
+        None => 0,
+    };
+    let mut fbuf = [0u8; 128];
+    // one frame at a time: chunked on 1.1, raw on 1.0
+    let mut emit = |payload: &[u8]| -> bool {
+        if http11 {
+            write_sse_chunk(stream, payload)
+        } else {
+            stream.write_all(payload).is_ok()
+        }
+    };
+    if !emit(SSE_PREAMBLE) {
+        return false;
+    }
+    let mut id = start.saturating_add(1);
+    while id <= SSE_COUNT {
+        let mut f = Out::new(&mut fbuf);
+        sse_event(id, &mut f);
+        if f.overflow {
+            return false;
+        }
+        if !emit(f.as_slice()) {
+            return false;
+        }
+        id += 1;
+    }
+    if http11 {
+        if !stream.write_all(b"0\r\n\r\n").is_ok() {
+            return false;
+        }
+        return alive;
+    }
+    // HTTP/1.0: close-delimited, connection must close.
+    false
 }
 
 // ---- Range requests (RFC 7233): GET/HEAD /bytes --------------------------
@@ -2330,6 +2437,10 @@ fn serve(mut stream: TcpStream) {
             }
         } else if req.method == "GET" && path_of(req.target) == "/chunked" {
             if !send_chunked(&mut stream, ka) {
+                return;
+            }
+        } else if (req.method == "GET" || req.method == "HEAD") && path_of(req.target) == "/events" {
+            if !send_events(&mut stream, &req, ka) {
                 return;
             }
         } else {
