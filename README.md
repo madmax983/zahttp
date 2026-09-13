@@ -38,13 +38,38 @@ The ~30 baseline is process startup and per-connection thread spawn —
 | `/chunked`     | GET    | streams 64 generated chunks with `Transfer-Encoding: chunked` (no `Content-Length`) |
 | `/metrics`   | GET    | request counter                                    |
 | `/allocs`    | GET    | heap allocation counter (the proof)                |
-| `/bytes`     | GET/HEAD | 64 KiB deterministic body with RFC 7233 range support (see below) |
+| `/bytes`     | GET/HEAD | 64 KiB deterministic body with RFC 7233 ranges, `If-None-Match`, and `Accept-Encoding: gzip` (see below) |
 | `/upload`    | POST   | parses `multipart/form-data` bodies, returns a part summary (see below) |
 
 Also: proper `Date`/`Server`/`Content-Length`/`Connection` headers,
 HTTP/1.0 + 1.1 keep-alive with pipelined-byte shifting, `400`/`404`/`405`/
 `413`/`431`/`505` as appropriate, and a hand-rolled decimal printer
 (`push_u64`) because `format!` was disqualified.
+
+## gzip content-encoding (the dare, 2026-09-13)
+
+`GET`/`HEAD /bytes` negotiates `Accept-Encoding: gzip` (RFC 7231 3.1.2.2)
+with a hand-rolled gzip unit — no crates, no allocator:
+
+- **The unit**: LZ77 with 3-byte hash chains over a 32 KiB window (greedy,
+  max match 258), fixed Huffman codes (RFC 1951 3.2.6), an LSB-first bit
+  writer, and a table-free CRC32 — all over fixed stack buffers.
+- The 64 KiB body is compressed once into a `LazyLock`; every response
+  borrows slices of it, so per-request allocation stays at zero.
+- `Content-Encoding: gzip`, a distinct `ETag: "zahttp-bytes-v1+gzip"` for
+  the encoded representation, and `Vary: Accept-Encoding` on negotiated
+  responses. `HEAD` reports the gzipped `Content-Length`.
+- `Accept-Encoding` parsing honors `q=0` opt-outs (`gzip;q=0` → identity),
+  comma lists, case-insensitive tokens, and `*`.
+- Like nginx, **Range wins over encoding**: a range request is always
+  served as an identity 206, never gzipped.
+- The LCG body is pseudo-random, so it compresses to ~1.05x (69,136
+  bytes) — honest output from a real encoder, not a miracle.
+
+- Verification: 35 protocol checks green, including a byte-for-byte
+  round-trip of the full 64 KiB through Python's independent `gzip`
+  decoder, and `/allocs` moved **0** across 25 gzipped responses on one
+  keep-alive connection.
 
 ## OPTIONS (the dare, 2026-09-13)
 
