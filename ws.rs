@@ -229,6 +229,9 @@ pub(crate) fn ws_close(stream: &mut TcpStream, code: u16, reason: &[u8]) {
 }
 
 pub(crate) fn ws_serve(stream: &mut TcpStream, req: &Request) {
+    // An upgraded connection is no longer HTTP keep-alive, so the HTTP
+    // idle read timeout must not reap a quiet websocket.
+    let _ = stream.set_read_timeout(None);
     match header(req, "sec-websocket-version") {
         Some("13") => {}
         Some(_) => {
