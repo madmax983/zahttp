@@ -1,13 +1,14 @@
 // zahttp module: ranges (RFC 7233 /bytes) — zero deps, zero heap. See main.rs for the rules.
 
-use std::io::{IoSlice, Write};
+use std::io::Write;
 use std::net::TcpStream;
 use std::sync::LazyLock;
 
-use crate::buf::{date_now, parse_u64b, Out};
-use crate::routes::reason;
+use crate::buf::{date_now, http_date_unix, parse_u64b, write2, Out};
+use crate::dates::parse_http_date;
+use crate::routes::{reason, send};
 use crate::gzip::{gzip_encode, GZIP_CAP};
-use crate::http::{header, trim, write_all_vectored, Request};
+use crate::http::{header, trim, Request};
 
 // ---- Range requests (RFC 7233): GET/HEAD /bytes --------------------------
 // Serves a fixed 64 KiB deterministic body with single, open-ended, suffix,
@@ -38,6 +39,9 @@ pub(crate) static GZIP_BYTES: LazyLock<(usize, [u8; GZIP_CAP])> = LazyLock::new(
 
 
 pub(crate) const RANGE_ETAG: &str = "\"zahttp-bytes-v1\"";
+// The representation never changes, so Last-Modified is a fixed
+// instant: Sun, 13 Sep 2026 00:00:00 GMT.
+pub(crate) const RANGE_LAST_MODIFIED: u64 = 1789257600;
 pub(crate) const RANGE_BOUNDARY: &str = "zahttp-range-7f3a9c";
 pub(crate) const MAX_RANGES: usize = 8;
 // Part-header literals shared between the writer and the length math so the
@@ -166,6 +170,16 @@ pub(crate) fn range_head_end(h: &mut Out, content_length: u64, keep_alive: bool)
     h.push_str("\r\n\r\n");
 }
 
+// Last-Modified for the /bytes representation, formatted with the same
+// hand-rolled date math as Date:.
+pub(crate) fn push_last_modified(h: &mut Out) {
+    let mut lm = [0u8; 29];
+    http_date_unix(RANGE_LAST_MODIFIED, &mut lm);
+    h.push_str("Last-Modified: ");
+    h.push(&lm);
+    h.push_str("\r\n");
+}
+
 pub(crate) fn send_range_full(stream: &mut TcpStream, keep_alive: bool, with_body: bool, etag: &str) -> bool {
     let mut hbuf = [0u8; 384];
     let mut h = Out::new(&mut hbuf);
@@ -173,13 +187,13 @@ pub(crate) fn send_range_full(stream: &mut TcpStream, keep_alive: bool, with_bod
     h.push_str("Content-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nETag: ");
     h.push_str(etag);
     h.push_str("\r\nVary: Accept-Encoding\r\n");
+    push_last_modified(&mut h);
     range_head_end(&mut h, RANGE_TOTAL as u64, keep_alive);
     if h.overflow {
         return false;
     }
-    let payload: &[u8] = if with_body { &RANGE_BODY[..] } else { &[] };
-    let mut bufs = [IoSlice::new(h.as_slice()), IoSlice::new(payload)];
-    write_all_vectored(stream, &mut bufs)
+    let body: &[u8] = if with_body { &RANGE_BODY[..] } else { &[] };
+    write2(stream, h.as_slice(), body)
 }
 
 pub(crate) fn send_gzip_full(stream: &mut TcpStream, keep_alive: bool, with_body: bool) -> bool {
@@ -192,13 +206,13 @@ pub(crate) fn send_gzip_full(stream: &mut TcpStream, keep_alive: bool, with_body
     );
     h.push_str(RANGE_ETAG_GZIP);
     h.push_str("\r\nVary: Accept-Encoding\r\n");
+    push_last_modified(&mut h);
     range_head_end(&mut h, gz.0 as u64, keep_alive);
     if h.overflow {
         return false;
     }
-    let payload: &[u8] = if with_body { &gz.1[..gz.0] } else { &[] };
-    let mut bufs = [IoSlice::new(h.as_slice()), IoSlice::new(payload)];
-    write_all_vectored(stream, &mut bufs)
+    let body: &[u8] = if with_body { &gz.1[..gz.0] } else { &[] };
+    write2(stream, h.as_slice(), body)
 }
 
 pub(crate) fn send_range_single(
@@ -222,17 +236,17 @@ pub(crate) fn send_range_single(
     h.push_str("/");
     h.push_u64(total);
     h.push_str("\r\n");
+    push_last_modified(&mut h);
     range_head_end(&mut h, last - first + 1, keep_alive);
     if h.overflow {
         return false;
     }
-    let payload: &[u8] = if with_body {
+    let body: &[u8] = if with_body {
         &RANGE_BODY[first as usize..=last as usize]
     } else {
         &[]
     };
-    let mut bufs = [IoSlice::new(h.as_slice()), IoSlice::new(payload)];
-    write_all_vectored(stream, &mut bufs)
+    write2(stream, h.as_slice(), body)
 }
 
 pub(crate) fn send_range_multi(
@@ -257,6 +271,7 @@ pub(crate) fn send_range_multi(
     h.push_str("\r\nAccept-Ranges: bytes\r\nETag: ");
     h.push_str(etag);
     h.push_str("\r\n");
+    push_last_modified(&mut h);
     range_head_end(&mut h, content_length, keep_alive);
     // multipart/byteranges never combines with gzip (Range wins), so no Vary.
     if h.overflow {
@@ -316,7 +331,9 @@ pub(crate) fn send_not_modified(stream: &mut TcpStream, keep_alive: bool, etag: 
     range_head_start(&mut h, 304);
     h.push_str("ETag: ");
     h.push_str(etag);
-    h.push_str("\r\nVary: Accept-Encoding\r\nConnection: ");
+    h.push_str("\r\nVary: Accept-Encoding\r\n");
+    push_last_modified(&mut h);
+    h.push_str("Connection: ");
     h.push_str(if keep_alive { "keep-alive" } else { "close" });
     h.push_str("\r\n\r\n");
     // 304 never carries a body, so no Content-Length is needed for framing.
@@ -358,11 +375,32 @@ pub(crate) fn send_ranges(stream: &mut TcpStream, req: &Request, keep_alive: boo
     // never combined with Range — like nginx, Range wins over encoding.
     let gzip = header(req, "range").is_none() && accepts_gzip(req) && GZIP_BYTES.0 > 0;
     let etag = if gzip { RANGE_ETAG_GZIP } else { RANGE_ETAG };
+    // Date preconditions, RFC 7232 6 precedence: If-Unmodified-Since is
+    // evaluated before If-None-Match, and If-Modified-Since is ignored
+    // whenever If-None-Match is present. An unparsable date is ignored,
+    // never a 400 (RFC 7232 3.3, 3.4). Either precondition short-circuits
+    // Range, like If-None-Match already did.
+    if let Some(v) = header(req, "if-unmodified-since") {
+        if let Some(t) = parse_http_date(v.as_bytes()) {
+            if RANGE_LAST_MODIFIED > t {
+                return send(stream, 412, "text/plain", b"precondition failed\n", keep_alive, true);
+            }
+        }
+    }
     // RFC 7232 3.3: a matching If-None-Match short-circuits everything,
     // including Range, with 304 Not Modified.
     if let Some(v) = header(req, "if-none-match") {
         if etag_list_matches(v, etag) {
             return send_not_modified(stream, keep_alive, etag);
+        }
+    }
+    if header(req, "if-none-match").is_none() {
+        if let Some(v) = header(req, "if-modified-since") {
+            if let Some(t) = parse_http_date(v.as_bytes()) {
+                if RANGE_LAST_MODIFIED <= t {
+                    return send_not_modified(stream, keep_alive, etag);
+                }
+            }
         }
     }
     let mut rs = [(0u64, 0u64); MAX_RANGES];

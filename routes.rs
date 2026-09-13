@@ -1,12 +1,12 @@
 // zahttp module: routes (dispatch + small handlers) — zero deps, zero heap. See main.rs for the rules.
 
-use std::io::{IoSlice, Write};
+use std::io::Write;
 use std::net::TcpStream;
 use std::sync::atomic::Ordering;
 
 use crate::alloc::{ALLOC_COUNT, REQUEST_COUNT};
-use crate::buf::{date_now, push_hex_u64, push_hex_usize, Out, RESP_HEAD_CAP};
-use crate::http::{header, path_of, write_all_vectored, Request};
+use crate::buf::{date_now, push_hex_u64, push_hex_usize, write2, write3, Out, RESP_HEAD_CAP};
+use crate::http::{header, path_of, Request};
 use crate::multipart::serve_upload;
 
 // ---- routing ------------------------------------------------------------
@@ -140,6 +140,7 @@ pub(crate) fn reason(status: u16) -> &'static str {
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        412 => "Precondition Failed",
         413 => "Content Too Large",
         416 => "Range Not Satisfiable",
         417 => "Expectation Failed",
@@ -178,8 +179,9 @@ pub(crate) fn send(
         return false;
     }
     let payload: &[u8] = if with_body { body } else { &[] };
-    let mut bufs = [IoSlice::new(h.as_slice()), IoSlice::new(payload)];
-    write_all_vectored(stream, &mut bufs)
+    // One writev for head+body: keeps the tiny body from stalling
+    // behind the header's delayed ACK (see buf::write2).
+    write2(stream, h.as_slice(), payload)
 }
 
 // Stream a generated body with Transfer-Encoding: chunked. 64 chunks of
@@ -229,12 +231,7 @@ pub(crate) fn send_chunked(stream: &mut TcpStream, keep_alive: bool) -> bool {
         if c.overflow {
             return false;
         }
-        let mut bufs = [
-            IoSlice::new(c.as_slice()),
-            IoSlice::new(payload),
-            IoSlice::new(b"\r\n"),
-        ];
-        if !write_all_vectored(stream, &mut bufs) {
+        if !write3(stream, c.as_slice(), payload, b"\r\n") {
             return false;
         }
         i += 1;

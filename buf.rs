@@ -1,5 +1,7 @@
 // zahttp module: buf (fixed buffers) — zero deps, zero heap. See main.rs for the rules.
 
+use std::io::{IoSlice, Write};
+use std::net::TcpStream;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---- fixed capacities: the whole server lives in these ------------------
@@ -159,6 +161,74 @@ pub(crate) fn parse_u64b(s: &[u8]) -> Option<u64> {
         v = v.checked_mul(10)?.checked_add((c - b'0') as u64)?;
     }
     Some(v)
+}
+
+// ---- write2: one vectored write for head+body ---------------------------
+// Performance contract: every non-streaming response emits its headers
+// and body in a single write_vectored() call. A tiny header followed by
+// a tiny body used to leave as two separate write() calls; with Nagle
+// enabled the second, small segment waited on the delayed ACK of the
+// first (~40 ms on loopback), which is why sequential /health showed a
+// 41 ms p50 while the head arrived in under 1 ms. One writev means one
+// segment, so the pair can never be split across the ACK boundary again.
+//
+// Partial writes are handled by looping and advancing across both
+// slices — a vectored write is never assumed to take everything. The
+// IoSlice pair lives on the stack: zero allocation, like everything
+// else here. Ok(0) on a non-empty write means the peer is gone; we
+// report failure instead of spinning.
+pub(crate) fn write2(stream: &mut TcpStream, a: &[u8], b: &[u8]) -> bool {
+    let mut a = a;
+    let mut b = b;
+    loop {
+        if a.is_empty() && b.is_empty() {
+            return true;
+        }
+        let bufs = [IoSlice::new(a), IoSlice::new(b)];
+        let from = usize::from(a.is_empty());
+        match stream.write_vectored(&bufs[from..]) {
+            Ok(0) => return false,
+            Ok(n) => {
+                let mut rem = n;
+                let take = rem.min(a.len());
+                a = &a[take..];
+                rem -= take;
+                b = &b[rem.min(b.len())..];
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+// write2's three-buffer twin, for send_chunked's <hexlen>\r\n + payload +
+// \r\n framing: the same Nagle reasoning applies per chunk, not just per
+// response, and it used to cost three write() calls per chunk instead
+// of one.
+pub(crate) fn write3(stream: &mut TcpStream, a: &[u8], b: &[u8], c: &[u8]) -> bool {
+    let mut a = a;
+    let mut b = b;
+    let mut c = c;
+    loop {
+        if a.is_empty() && b.is_empty() && c.is_empty() {
+            return true;
+        }
+        let bufs = [IoSlice::new(a), IoSlice::new(b), IoSlice::new(c)];
+        let from = usize::from(a.is_empty()) + usize::from(a.is_empty() && b.is_empty());
+        match stream.write_vectored(&bufs[from..]) {
+            Ok(0) => return false,
+            Ok(n) => {
+                let mut rem = n;
+                let take = rem.min(a.len());
+                a = &a[take..];
+                rem -= take;
+                let take = rem.min(b.len());
+                b = &b[take..];
+                rem -= take;
+                c = &c[rem.min(c.len())..];
+            }
+            Err(_) => return false,
+        }
+    }
 }
 
 // Parse one byte-range-spec into an inclusive (first, last). False when

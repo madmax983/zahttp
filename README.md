@@ -56,10 +56,13 @@ HTTP/1.0 + 1.1 keep-alive with pipelined-byte shifting, `400`/`404`/`405`/
 `GET`/`HEAD /events` serves an **infinite** live feed per the HTML spec —
 `Content-Type: text/event-stream`, `Cache-Control: no-cache`, a
 `: zahttp event stream` comment plus `retry: 3000` preamble, then one
-`tick` event per second, forever: `id: N`, `event: tick`, `data: N`.
+event per second, forever, cycling `tick`, `tick`, `note`, `tick`, `bye`:
+`tick` carries `data: <id>`, `note` carries two data lines (`line one`,
+`line two`), `bye` carries `data: farewell`. The pattern is the original
+finite 5-event motif, now repeating forever — `note` and `bye` are back.
 Zero heap: every frame is assembled in one reused 128-byte stack buffer
 and written as its own chunk; the connection thread parks in
-`thread::sleep` between ticks, and the first failed write (client gone)
+`thread::sleep` between events, and the first failed write (client gone)
 is the only exit.
 
 - **Framing**: `Transfer-Encoding: chunked` on HTTP/1.1 (no terminating
@@ -85,7 +88,8 @@ else. Everything else is a module with one job:
 | Module         | Job                                                        |
 |----------------|------------------------------------------------------------|
 | `alloc.rs`     | the counting global allocator — the proof                   |
-| `buf.rs`       | `Out`, the fixed-buffer writer; HTTP dates; integer parsing |
+| `buf.rs`       | `Out`, the fixed-buffer writer; HTTP dates; integer parsing; `write2`, the one-`writev` response writer |
+| `dates.rs`     | HTTP-date parsing (RFC 7231 7.1.1.1) for date conditionals   |
 | `http.rs`      | request parsing, framing, `Expect`, the `send()` writer     |
 | `routes.rs`    | `INDEX`, `route()`, `OPTIONS`, small handlers               |
 | `sse.rs`       | `GET /events` — the infinite Server-Sent Events feed        |
@@ -96,6 +100,33 @@ else. Everything else is a module with one job:
 
 The static gate runs over every module: no `String`, `Vec<`, `Box<`,
 `format!`, `vec!`, `unwrap()`, or `expect(` in authored code.
+
+## One writev per response (the dare, 2026-09-13)
+
+Benchmarking caught a real client-visible defect: sequential keep-alive
+`/health` showed p50 **41 ms** while the head arrived in under 1 ms.
+The body — 3 bytes — was waiting on the delayed ACK of the header
+segment, because the response left as two separate `write()` calls with
+Nagle enabled.
+
+The fix is `buf::write2()`: every non-streaming response (ordinary
+routes, `/bytes` full/single/gzip, WebSocket frames) now emits headers +
+body in a single `write_vectored()` call — one syscall, one segment —
+with a loop that advances across both slices on partial writes. The
+`IoSlice` pair lives on the stack, so the zero-allocation contract
+holds (`/allocs` delta 0 over 200 writev responses). `TCP_NODELAY` was
+deliberately not set: coalescing kills the artifact without changing
+congestion behavior for anyone else.
+
+Measured on the same box, same harness (`bench.py`, local `BENCHES.md`):
+
+- sequential `/health`: p50 41.0 ms → **0.023 ms** (24 → **33,039 req/s**)
+- pipelined `/bytes` (64 KiB): 12,234 → **28,376 req/s** (765 → 1,774 MiB/s)
+- 8-thread `/health`: 9,983 → **18,476 req/s**
+- strace: 5 requests → 5 `writev` calls, each taking both slices whole
+
+`nagle_test.py` is the regression: it fails on the old binary, passes
+on the new one. All 180 protocol checks stayed green.
 
 ## gzip content-encoding (the dare, 2026-09-13)
 
@@ -159,6 +190,31 @@ with a hand-rolled gzip unit — no crates, no allocator:
   stale etag → 200, match+Range → 304, header-name case-insensitivity,
   and a 304 followed by another request on the same keep-alive
   connection. `/allocs` delta **0** across 25 conditional 304s.
+
+## Date conditionals (the dare, 2026-09-13)
+
+`GET`/`HEAD /bytes` also speaks dates, per RFC 7232 3.3/3.4 — the
+sequel to the etag dare. The representation never changes, so
+`Last-Modified` is a fixed instant (`Sun, 13 Sep 2026 00:00:00 GMT`),
+advertised on every 200, 206, gzip 200, and 304:
+
+- `If-Modified-Since` → `304 Not Modified` when the representation is
+  no newer than the given date; ignored when `If-None-Match` is present
+  (RFC 7232 3.3 — the etag is the more accurate validator).
+- `If-Unmodified-Since` → `412 Precondition Failed` when the
+  representation is newer than the given date. Evaluated *before*
+  `If-None-Match` (RFC 7232 6 precedence), and both preconditions
+  short-circuit `Range`.
+- Unparsable dates are ignored, never a 400 — including impossible
+  days (`32 Sep`), bad times, and garbage.
+- The date parser (`dates.rs`) accepts all three HTTP-date formats the
+  RFC requires: IMF-fixdate, obsolete RFC 850 (with the >50-years
+  pivot rule for two-digit years), and asctime — all hand-rolled, all
+  stack-only, validated with checked arithmetic (2021-02-29 is
+  rejected, 2020-02-29 is not).
+- Verification: 27 checks green — all three formats, both directions,
+  precedence ordering, Range interaction, garbage tolerance. `/allocs`
+  delta **0** across 200 mixed conditional requests on one connection.
 
 ## Expect: 100-continue (the dare, 2026-09-13)
 

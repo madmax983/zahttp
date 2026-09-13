@@ -1,6 +1,6 @@
 // zahttp module: http (request parsing + framing) — zero deps, zero heap. See main.rs for the rules.
 
-use std::io::{IoSlice, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 
 use crate::buf::HDR_MAX;
@@ -440,19 +440,4 @@ pub(crate) fn expect_of(head: &[u8]) -> Expect {
 
 pub(crate) fn send_100(stream: &mut TcpStream) -> bool {
     stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").is_ok()
-}
-
-// Write buffers as one writev(2) instead of one write(2) per buffer -
-// same bytes on the wire, fewer syscalls. Loops only on a short write.
-pub(crate) fn write_all_vectored(stream: &mut TcpStream, bufs: &mut [IoSlice<'_>]) -> bool {
-    let mut bufs = bufs;
-    while !bufs.is_empty() {
-        match stream.write_vectored(bufs) {
-            Ok(0) => return false,
-            Ok(n) => IoSlice::advance_slices(&mut bufs, n),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return false,
-        }
-    }
-    true
 }

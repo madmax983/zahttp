@@ -3,11 +3,15 @@
 // ---- Server-Sent Events (HTML spec): GET /events -----------------------
 // An infinite live feed, paced by a 1s timer. `Content-Type:
 // text/event-stream`, `Cache-Control: no-cache`, chunked on HTTP/1.1,
-// close-delimited on HTTP/1.0. `Last-Event-ID` resumes the tick counter
+// close-delimited on HTTP/1.0. `Last-Event-ID` resumes the event counter
 // after that id (garbage or absent means 0). Every frame is built in one
 // reused 128-byte stack buffer — no allocator anywhere. The connection
-// thread parks in thread::sleep between ticks; the first failed write
+// thread parks in thread::sleep between events; the first failed write
 // (client gone) ends the stream.
+//
+// The event pattern cycles every 5, faithful to the original finite
+// stream: tick, tick, note (two data lines), tick, bye — then repeats.
+// `note` and `bye` are back.
 
 use std::io::Write;
 use std::net::TcpStream;
@@ -20,12 +24,20 @@ use crate::http::{header, Request};
 pub(crate) const SSE_INTERVAL: Duration = Duration::from_secs(1);
 const SSE_PREAMBLE: &[u8] = b": zahttp event stream\nretry: 3000\n\n";
 
-pub(crate) fn sse_tick(id: u64, o: &mut Out) {
+pub(crate) fn sse_event(id: u64, o: &mut Out) {
     o.push_str("id: ");
     o.push_u64(id);
-    o.push_str("\nevent: tick\ndata: ");
-    o.push_u64(id);
-    o.push_str("\n\n");
+    o.push_str("\nevent: ");
+    match id % 5 {
+        1 | 2 | 4 => {
+            o.push_str("tick\ndata: ");
+            o.push_u64(id);
+            o.push_str("\n");
+        }
+        3 => o.push_str("note\ndata: line one\ndata: line two\n"),
+        _ => o.push_str("bye\ndata: farewell\n"),
+    }
+    o.push_str("\n");
 }
 
 fn write_sse_chunk(stream: &mut TcpStream, payload: &[u8]) -> bool {
@@ -88,15 +100,16 @@ pub(crate) fn send_events(stream: &mut TcpStream, req: &Request, keep_alive: boo
     if !emit(SSE_PREAMBLE) {
         return false;
     }
-    // The feed never ends: tick forever, one per SSE_INTERVAL. A failed
-    // write means the client is gone; that is the only exit.
+    // The feed never ends: one event per SSE_INTERVAL, cycling
+    // tick/tick/note/tick/bye forever. A failed write means the client
+    // is gone; that is the only exit.
     let mut id = start.wrapping_add(1);
     if id == 0 {
         id = 1; // id 0 is reserved for "no resume point"
     }
     loop {
         let mut f = Out::new(&mut fbuf);
-        sse_tick(id, &mut f);
+        sse_event(id, &mut f);
         if f.overflow {
             return false;
         }
