@@ -1,10 +1,10 @@
 // zahttp module: ranges (RFC 7233 /bytes) — zero deps, zero heap. See main.rs for the rules.
 
-use std::io::Write;
 use std::net::TcpStream;
 use std::sync::LazyLock;
+use std::time::Instant;
 
-use crate::buf::{date_now, http_date_unix, parse_u64b, write2, Out};
+use crate::buf::{date_now, http_date_unix, parse_u64b, write2_before, write_all_before, Out};
 use crate::dates::parse_http_date;
 use crate::routes::{reason, send};
 use crate::gzip::{gzip_encode, GZIP_CAP};
@@ -180,7 +180,7 @@ pub(crate) fn push_last_modified(h: &mut Out) {
     h.push_str("\r\n");
 }
 
-pub(crate) fn send_range_full(stream: &mut TcpStream, keep_alive: bool, with_body: bool, etag: &str) -> bool {
+pub(crate) fn send_range_full(stream: &mut TcpStream, keep_alive: bool, with_body: bool, etag: &str, deadline: Instant) -> bool {
     let mut hbuf = [0u8; 384];
     let mut h = Out::new(&mut hbuf);
     range_head_start(&mut h, 200);
@@ -193,10 +193,10 @@ pub(crate) fn send_range_full(stream: &mut TcpStream, keep_alive: bool, with_bod
         return false;
     }
     let body: &[u8] = if with_body { &RANGE_BODY[..] } else { &[] };
-    write2(stream, h.as_slice(), body)
+    write2_before(stream, h.as_slice(), body, deadline)
 }
 
-pub(crate) fn send_gzip_full(stream: &mut TcpStream, keep_alive: bool, with_body: bool) -> bool {
+pub(crate) fn send_gzip_full(stream: &mut TcpStream, keep_alive: bool, with_body: bool, deadline: Instant) -> bool {
     let gz = &*GZIP_BYTES;
     let mut hbuf = [0u8; 384];
     let mut h = Out::new(&mut hbuf);
@@ -212,7 +212,7 @@ pub(crate) fn send_gzip_full(stream: &mut TcpStream, keep_alive: bool, with_body
         return false;
     }
     let body: &[u8] = if with_body { &gz.1[..gz.0] } else { &[] };
-    write2(stream, h.as_slice(), body)
+    write2_before(stream, h.as_slice(), body, deadline)
 }
 
 pub(crate) fn send_range_single(
@@ -222,6 +222,7 @@ pub(crate) fn send_range_single(
     first: u64,
     last: u64,
     etag: &str,
+    deadline: Instant,
 ) -> bool {
     let total = RANGE_TOTAL as u64;
     let mut hbuf = [0u8; 384];
@@ -246,7 +247,7 @@ pub(crate) fn send_range_single(
     } else {
         &[]
     };
-    write2(stream, h.as_slice(), body)
+    write2_before(stream, h.as_slice(), body, deadline)
 }
 
 pub(crate) fn send_range_multi(
@@ -255,6 +256,7 @@ pub(crate) fn send_range_multi(
     with_body: bool,
     rs: &[(u64, u64)],
     etag: &str,
+    deadline: Instant,
 ) -> bool {
     let total = RANGE_TOTAL as u64;
     let b = RANGE_BOUNDARY;
@@ -277,7 +279,7 @@ pub(crate) fn send_range_multi(
     if h.overflow {
         return false;
     }
-    if !stream.write_all(h.as_slice()).is_ok() {
+    if !write_all_before(stream, h.as_slice(), deadline) {
         return false;
     }
     if with_body {
@@ -298,16 +300,14 @@ pub(crate) fn send_range_multi(
             if p.overflow {
                 return false;
             }
-            if !stream.write_all(p.as_slice()).is_ok() {
+            if !write_all_before(stream, p.as_slice(), deadline) {
                 return false;
             }
-            if !stream
-                .write_all(&RANGE_BODY[first as usize..=last as usize])
-                .is_ok()
+            if !write_all_before(stream, &RANGE_BODY[first as usize..=last as usize], deadline)
             {
                 return false;
             }
-            if !stream.write_all(b"\r\n").is_ok() {
+            if !write_all_before(stream, b"\r\n", deadline) {
                 return false;
             }
         }
@@ -318,14 +318,14 @@ pub(crate) fn send_range_multi(
         if p.overflow {
             return false;
         }
-        if !stream.write_all(p.as_slice()).is_ok() {
+        if !write_all_before(stream, p.as_slice(), deadline) {
             return false;
         }
     }
     true
 }
 
-pub(crate) fn send_not_modified(stream: &mut TcpStream, keep_alive: bool, etag: &str) -> bool {
+pub(crate) fn send_not_modified(stream: &mut TcpStream, keep_alive: bool, etag: &str, deadline: Instant) -> bool {
     let mut hbuf = [0u8; 384];
     let mut h = Out::new(&mut hbuf);
     range_head_start(&mut h, 304);
@@ -337,7 +337,7 @@ pub(crate) fn send_not_modified(stream: &mut TcpStream, keep_alive: bool, etag: 
     h.push_str(if keep_alive { "keep-alive" } else { "close" });
     h.push_str("\r\n\r\n");
     // 304 never carries a body, so no Content-Length is needed for framing.
-    !h.overflow && stream.write_all(h.as_slice()).is_ok()
+    !h.overflow && write_all_before(stream, h.as_slice(), deadline)
 }
 
 // RFC 7232 2.3.2 + 3.3: If-None-Match uses the weak comparison function.
@@ -368,7 +368,7 @@ pub(crate) fn etag_list_matches(value: &str, etag: &str) -> bool {
     }
 }
 
-pub(crate) fn send_ranges(stream: &mut TcpStream, req: &Request, keep_alive: bool) -> bool {
+pub(crate) fn send_ranges(stream: &mut TcpStream, req: &Request, keep_alive: bool, deadline: Instant) -> bool {
     let total = RANGE_TOTAL as u64;
     let with_body = req.method == "GET"; // HEAD: headers only
     // Content negotiation (RFC 7231 3.1.2.2): gzip only for full-body 200s,
@@ -383,7 +383,7 @@ pub(crate) fn send_ranges(stream: &mut TcpStream, req: &Request, keep_alive: boo
     if let Some(v) = header(req, "if-unmodified-since") {
         if let Some(t) = parse_http_date(v.as_bytes()) {
             if RANGE_LAST_MODIFIED > t {
-                return send(stream, 412, "text/plain", b"precondition failed\n", keep_alive, true);
+                return send(stream, 412, "text/plain", b"precondition failed\n", keep_alive, true, deadline);
             }
         }
     }
@@ -391,14 +391,14 @@ pub(crate) fn send_ranges(stream: &mut TcpStream, req: &Request, keep_alive: boo
     // including Range, with 304 Not Modified.
     if let Some(v) = header(req, "if-none-match") {
         if etag_list_matches(v, etag) {
-            return send_not_modified(stream, keep_alive, etag);
+            return send_not_modified(stream, keep_alive, etag, deadline);
         }
     }
     if header(req, "if-none-match").is_none() {
         if let Some(v) = header(req, "if-modified-since") {
             if let Some(t) = parse_http_date(v.as_bytes()) {
                 if RANGE_LAST_MODIFIED <= t {
-                    return send_not_modified(stream, keep_alive, etag);
+                    return send_not_modified(stream, keep_alive, etag, deadline);
                 }
             }
         }
@@ -423,7 +423,7 @@ pub(crate) fn send_ranges(stream: &mut TcpStream, req: &Request, keep_alive: boo
                         h.push_u64(total);
                         h.push_str("\r\n");
                         range_head_end(&mut h, 0, keep_alive);
-                        return !h.overflow && stream.write_all(h.as_slice()).is_ok();
+                        return !h.overflow && write_all_before(stream, h.as_slice(), deadline);
                     }
                 }
             }
@@ -432,14 +432,14 @@ pub(crate) fn send_ranges(stream: &mut TcpStream, req: &Request, keep_alive: boo
     };
     if nranges == 0 {
         if gzip {
-            send_gzip_full(stream, keep_alive, with_body)
+            send_gzip_full(stream, keep_alive, with_body, deadline)
         } else {
-            send_range_full(stream, keep_alive, with_body, etag)
+            send_range_full(stream, keep_alive, with_body, etag, deadline)
         }
     } else if nranges == 1 {
-        send_range_single(stream, keep_alive, with_body, rs[0].0, rs[0].1, etag)
+        send_range_single(stream, keep_alive, with_body, rs[0].0, rs[0].1, etag, deadline)
     } else {
-        send_range_multi(stream, keep_alive, with_body, &rs[..nranges], etag)
+        send_range_multi(stream, keep_alive, with_body, &rs[..nranges], etag, deadline)
     }
 }
 
