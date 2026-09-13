@@ -13,12 +13,12 @@
 // stream: tick, tick, note (two data lines), tick, bye — then repeats.
 // `note` and `bye` are back.
 
-use std::io::Write;
 use std::net::TcpStream;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::buf::{date_now, parse_u64b, push_hex_usize, Out};
+use crate::buf::{date_now, parse_u64b, push_hex_usize, write_all_before, Out};
+use crate::write_deadline;
 use crate::http::{header, Request};
 
 pub(crate) const SSE_INTERVAL: Duration = Duration::from_secs(1);
@@ -40,7 +40,7 @@ pub(crate) fn sse_event(id: u64, o: &mut Out) {
     o.push_str("\n");
 }
 
-fn write_sse_chunk(stream: &mut TcpStream, payload: &[u8]) -> bool {
+fn write_sse_chunk(stream: &mut TcpStream, payload: &[u8], deadline: Instant) -> bool {
     let mut cbuf = [0u8; 24];
     let mut c = Out::new(&mut cbuf);
     push_hex_usize(&mut c, payload.len());
@@ -48,12 +48,12 @@ fn write_sse_chunk(stream: &mut TcpStream, payload: &[u8]) -> bool {
     if c.overflow {
         return false;
     }
-    stream.write_all(c.as_slice()).is_ok()
-        && stream.write_all(payload).is_ok()
-        && stream.write_all(b"\r\n").is_ok()
+    write_all_before(stream, c.as_slice(), deadline)
+        && write_all_before(stream, payload, deadline)
+        && write_all_before(stream, b"\r\n", deadline)
 }
 
-pub(crate) fn send_events(stream: &mut TcpStream, req: &Request, keep_alive: bool) -> bool {
+pub(crate) fn send_events(stream: &mut TcpStream, req: &Request, keep_alive: bool, deadline: Instant) -> bool {
     let with_body = req.method == "GET"; // HEAD: headers only
     let http11 = req.version == 1;
     // HTTP/1.0 is close-delimited: no Content-Length, no chunked framing,
@@ -75,7 +75,7 @@ pub(crate) fn send_events(stream: &mut TcpStream, req: &Request, keep_alive: boo
     h.push_str("Connection: ");
     h.push_str(if alive { "keep-alive" } else { "close" });
     h.push_str("\r\n\r\n");
-    if h.overflow || !stream.write_all(h.as_slice()).is_ok() {
+    if h.overflow || !write_all_before(stream, h.as_slice(), deadline) {
         return false;
     }
     if !with_body {
@@ -91,10 +91,14 @@ pub(crate) fn send_events(stream: &mut TcpStream, req: &Request, keep_alive: boo
     let mut fbuf = [0u8; 128];
     // one frame at a time: chunked on 1.1, raw on 1.0
     let mut emit = |payload: &[u8]| -> bool {
+        // Per-event write deadline: the stream is infinite by design, so
+        // it cannot carry one total deadline; a stalled write still
+        // reaps a non-reading client within WRITE_TIMEOUT_SECS.
+        let wd = write_deadline();
         if http11 {
-            write_sse_chunk(stream, payload)
+            write_sse_chunk(stream, payload, wd)
         } else {
-            stream.write_all(payload).is_ok()
+            write_all_before(stream, payload, wd)
         }
     };
     if !emit(SSE_PREAMBLE) {
