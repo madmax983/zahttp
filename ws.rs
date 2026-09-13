@@ -3,7 +3,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-use crate::buf::{date_now, Out};
+use crate::buf::{date_now, write2, Out};
 use crate::http::{header, trim, Request};
 
 // ---- SHA-1 (FIPS 180-4), hand-rolled ------------------------------------
@@ -214,7 +214,9 @@ pub(crate) fn ws_send(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> boo
         hbuf[3] = payload.len() as u8;
         4
     };
-    stream.write_all(&hbuf[..hlen]).is_ok() && stream.write_all(payload).is_ok()
+    // One writev for frame head+payload: same Nagle reasoning as
+    // buf::write2 — a tiny echo frame must not wait on a delayed ACK.
+    write2(stream, &hbuf[..hlen], payload)
 }
 
 pub(crate) fn ws_close(stream: &mut TcpStream, code: u16, reason: &[u8]) {
