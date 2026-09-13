@@ -80,3 +80,58 @@ above: `/chunked` is only 3% of requests but contributes roughly
 its per-chunk 3-way write to 1 write drops it to 66 calls per response
 (1 header + 64 chunks + 1 trailer), and collapsing the other routes' 2-way
 write to 1 removes another call from the remaining 97% of requests.
+
+## 🔧 Change
+
+Added `write_all_vectored()` (std only, no new crate): loops
+`TcpStream::write_vectored` over an `&mut [IoSlice]`, advancing with the
+stable `IoSlice::advance_slices` on a short write, otherwise identical in
+behavior to chaining `write_all` calls — same bytes, same order, same
+error handling (a 0-byte write or a real I/O error still fails the
+response the same way the old code did). Applied at the five call sites
+identified above: `send()`, `send_range_full`, `send_gzip_full`,
+`send_range_single`, and the per-chunk loop in `send_chunked()`. No public
+behavior, byte layout, or existing test/verification expectation changes.
+
+## 📊 Measurement
+
+`bench/measure_syscalls.sh 20 100`, same fixed seeded workload, same
+machine, same session — `strace -f -c` on an `rustc --edition 2021 -O`
+build, before vs. after:
+
+| syscall (response-path)        | before | after | delta |
+|---------------------------------|-------:|------:|------:|
+| `sendto`                        | 15,136 |   116 | -99.2% |
+| `writev`                        |      0 | 5,654 |    new |
+| `write`                         |      1 |     1 |     0 |
+| **write-family total**          | **15,137** | **5,771** | **-61.9%** |
+| **all syscalls (total)**        | **17,592** | **8,226** | **-53.2%** |
+
+The write-family count clears the impact floor ("a measurable reduction
+in syscall count") by a wide margin: 61.9% fewer write-family syscalls,
+with every remaining `sendto`/`writev` accounted for by the same
+byte-for-byte response bodies (verified with `cmp` against the
+unmodified binary for `/`, `/chunked`, and gzip `/bytes`, plus a
+3-request `/allocs` keep-alive check confirming the zero-heap invariant
+still holds — `heap_allocations_total` stayed at the ~30 startup baseline).
+
+Corroborating but *not* part of the gate (wall-clock is inadmissible on
+this hardware per policy): the same 2000-request workload's wall time
+dropped from 73.4s to 2.8s. That is consistent with removing a classic
+Nagle-vs-delayed-ACK stall — each response used to leave the socket as
+two or more TCP segments (header write, then a separately-flushed body
+write), and this box's TCP stack was visibly paying ~40ms per split
+response before this change.
+
+## 🔬 Reproduce
+
+```
+git checkout <baseline-commit>   # RED: harness + baseline, main.rs unchanged
+bash bench/measure_syscalls.sh 20 100
+
+git checkout <this-commit>       # GREEN: main.rs fix applied
+bash bench/measure_syscalls.sh 20 100
+```
+
+Both runs build with the documented `rustc --edition 2021 -O -o <bin>
+main.rs` — no `Cargo.toml`, no crates added.

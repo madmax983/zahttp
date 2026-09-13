@@ -12,7 +12,7 @@
 //     the counter; the per-request path is ours and stays flat.)
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::io::{Read, Write};
+use std::io::{IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
@@ -832,6 +832,21 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
+// Write buffers as one writev(2) instead of one write(2) per buffer -
+// same bytes on the wire, fewer syscalls. Loops only on a short write.
+fn write_all_vectored(stream: &mut TcpStream, bufs: &mut [IoSlice<'_>]) -> bool {
+    let mut bufs = bufs;
+    while !bufs.is_empty() {
+        match stream.write_vectored(bufs) {
+            Ok(0) => return false,
+            Ok(n) => IoSlice::advance_slices(&mut bufs, n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 fn send(
     stream: &mut TcpStream,
     status: u16,
@@ -861,7 +876,8 @@ fn send(
         return false;
     }
     let payload: &[u8] = if with_body { body } else { &[] };
-    stream.write_all(h.as_slice()).is_ok() && stream.write_all(payload).is_ok()
+    let mut bufs = [IoSlice::new(h.as_slice()), IoSlice::new(payload)];
+    write_all_vectored(stream, &mut bufs)
 }
 
 // Stream a generated body with Transfer-Encoding: chunked. 64 chunks of
@@ -911,13 +927,12 @@ fn send_chunked(stream: &mut TcpStream, keep_alive: bool) -> bool {
         if c.overflow {
             return false;
         }
-        if !stream.write_all(c.as_slice()).is_ok() {
-            return false;
-        }
-        if !stream.write_all(payload).is_ok() {
-            return false;
-        }
-        if !stream.write_all(b"\r\n").is_ok() {
+        let mut bufs = [
+            IoSlice::new(c.as_slice()),
+            IoSlice::new(payload),
+            IoSlice::new(b"\r\n"),
+        ];
+        if !write_all_vectored(stream, &mut bufs) {
             return false;
         }
         i += 1;
@@ -1097,13 +1112,9 @@ fn send_range_full(stream: &mut TcpStream, keep_alive: bool, with_body: bool, et
     if h.overflow {
         return false;
     }
-    if !stream.write_all(h.as_slice()).is_ok() {
-        return false;
-    }
-    if with_body {
-        return stream.write_all(&RANGE_BODY[..]).is_ok();
-    }
-    true
+    let payload: &[u8] = if with_body { &RANGE_BODY[..] } else { &[] };
+    let mut bufs = [IoSlice::new(h.as_slice()), IoSlice::new(payload)];
+    write_all_vectored(stream, &mut bufs)
 }
 
 fn send_gzip_full(stream: &mut TcpStream, keep_alive: bool, with_body: bool) -> bool {
@@ -1120,13 +1131,9 @@ fn send_gzip_full(stream: &mut TcpStream, keep_alive: bool, with_body: bool) -> 
     if h.overflow {
         return false;
     }
-    if !stream.write_all(h.as_slice()).is_ok() {
-        return false;
-    }
-    if with_body {
-        return stream.write_all(&gz.1[..gz.0]).is_ok();
-    }
-    true
+    let payload: &[u8] = if with_body { &gz.1[..gz.0] } else { &[] };
+    let mut bufs = [IoSlice::new(h.as_slice()), IoSlice::new(payload)];
+    write_all_vectored(stream, &mut bufs)
 }
 
 fn send_range_single(
@@ -1154,15 +1161,13 @@ fn send_range_single(
     if h.overflow {
         return false;
     }
-    if !stream.write_all(h.as_slice()).is_ok() {
-        return false;
-    }
-    if with_body {
-        return stream
-            .write_all(&RANGE_BODY[first as usize..=last as usize])
-            .is_ok();
-    }
-    true
+    let payload: &[u8] = if with_body {
+        &RANGE_BODY[first as usize..=last as usize]
+    } else {
+        &[]
+    };
+    let mut bufs = [IoSlice::new(h.as_slice()), IoSlice::new(payload)];
+    write_all_vectored(stream, &mut bufs)
 }
 
 fn send_range_multi(
