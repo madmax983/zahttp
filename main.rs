@@ -780,6 +780,7 @@ fn reason(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         413 => "Content Too Large",
         416 => "Range Not Satisfiable",
+        417 => "Expectation Failed",
         431 => "Request Header Fields Too Large",
         505 => "HTTP Version Not Supported",
         _ => "Unknown",
@@ -1205,6 +1206,51 @@ fn send_ranges(stream: &mut TcpStream, req: &Request, keep_alive: bool) -> bool 
     } else {
         send_range_multi(stream, keep_alive, with_body, &rs[..nranges])
     }
+}
+
+// What the client expects before sending the body (RFC 7231 5.1.1).
+#[derive(PartialEq, Eq)]
+enum Expect {
+    None,
+    Continue,
+    Other,
+}
+
+// Scan the raw head for an Expect header. HTTP/1.0 clients never get a
+// 100-continue: the interim status would confuse their framing.
+fn expect_of(head: &[u8]) -> Expect {
+    let req_line_end = match head.windows(2).position(|w| w == b"\r\n") {
+        Some(p) => p,
+        None => return Expect::None,
+    };
+    if head[..req_line_end].ends_with(b"HTTP/1.0") {
+        return Expect::None;
+    }
+    let mut rest = &head[req_line_end + 2..];
+    while !rest.is_empty() {
+        let eol = match rest.windows(2).position(|w| w == b"\r\n") {
+            Some(p) => p,
+            None => return Expect::None,
+        };
+        let line = &rest[..eol];
+        rest = &rest[eol + 2..];
+        let colon = match line.iter().position(|&c| c == b':') {
+            Some(p) => p,
+            None => continue,
+        };
+        if trim(&line[..colon]).eq_ignore_ascii_case(b"expect") {
+            let v = trim(&line[colon + 1..]);
+            if v.eq_ignore_ascii_case(b"100-continue") {
+                return Expect::Continue;
+            }
+            return Expect::Other;
+        }
+    }
+    Expect::None
+}
+
+fn send_100(stream: &mut TcpStream) -> bool {
+    stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").is_ok()
 }
 
 // ---- multipart/form-data parsing (RFC 7578): POST /upload --------------
@@ -1761,7 +1807,18 @@ fn serve(mut stream: TcpStream) {
         let mut decoded = [0u8; BODY_CAP];
         let body: &[u8];
         let consumed: usize;
+        // 2b. expectations (RFC 7231 5.1.1): answered before any body byte
+        // is read. Unknown expectations fail fast with 417; a 100-continue
+        // is only ever sent when a body is actually coming.
+        let expect = expect_of(&buf[..head_end + 4]);
+        if expect == Expect::Other {
+            send(&mut stream, 417, "text/plain", b"expectation failed\n", false, true);
+            return;
+        }
         if chunked {
+            if expect == Expect::Continue && !send_100(&mut stream) {
+                return;
+            }
             let mut pos = body_start;
             let dlen = match decode_chunked(&mut stream, &mut buf, body_start, &mut pos, &mut n, &mut decoded) {
                 Ok(l) => l,
@@ -1786,6 +1843,9 @@ fn serve(mut stream: TcpStream) {
             };
             if content_length > BODY_CAP {
                 send(&mut stream, 413, "text/plain", b"body too large\n", false, true);
+                return;
+            }
+            if expect == Expect::Continue && content_length > 0 && !send_100(&mut stream) {
                 return;
             }
             while n - body_start < content_length {
