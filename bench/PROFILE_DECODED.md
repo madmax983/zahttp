@@ -183,5 +183,46 @@ more expensive). The mechanism is identical to the original report:
 `decoded`'s zero-init still runs unconditionally in `serve()`, but
 `decoded` is only ever read inside the `if chunked` branch, which this
 workload never takes. The fix — move `decoded = [0u8; BODY_CAP]` inside
-that branch — is re-applied in the next (GREEN) commit and re-measured
-from scratch rather than assuming the old numbers still hold.
+that branch — is re-applied in this (GREEN) commit and re-measured from
+scratch rather than assuming the old numbers still hold.
+
+### After (this commit)
+
+Same command, same machine, same session, immediately after re-applying
+the fix:
+
+```
+84,245,581 (100.0%)  PROGRAM TOTALS
+
+24,256,539 (28.79%)  __memset_avx2_unaligned_erms  (libc)
+18,585,616 (22.06%)  main::gzip::gzip_encode
+ 8,299,220 ( 9.85%)  main::routes::send_chunked
+ 7,143,469 ( 8.48%)  __memcpy_avx_unaligned_erms
+ ...
+```
+
+| counter                                    |     before |      after |    delta |
+|---------------------------------------------|-----------:|-----------:|---------:|
+| total instructions (Ir)                      | 92,479,581 | 84,245,581 | **-8.90%** |
+| `__memset_avx2_unaligned_erms` (self cost)   | 32,482,539 | 24,256,539 | **-25.33%** |
+
+The removed instruction count (8,234,000) again lines up with the
+mechanism almost exactly: 2000 requests × 4096 bytes (`BODY_CAP`) =
+8,192,000 bytes no longer zeroed, plus ~17 instructions/call of fixed
+overhead — the same arithmetic as the original report, and within 0.02%
+of the exact byte count removed there (8,233,990), which is the
+determinism this counter is chosen for. Every other line in the
+breakdown (`gzip_encode`, `send_chunked`, `memcpy`, `is_chunked`,
+`content_length_of`, `expect_of`, `parse_head`, ...) is byte-for-byte
+unchanged between the two runs. Both clear the impact floor ("≥5%
+reduction in instruction count on a benchmark that represents ≥5% of
+realistic workload cost") comfortably.
+
+Verified byte-identical (via `cmp`, modulo the `Date:` header) against
+the unmodified binary for `/`, `/health`, `/chunked`, `POST /echo` with
+`Content-Length`, `POST /echo` with `Transfer-Encoding: chunked` (the
+one path that still pays for the zero-init), and gzip `/bytes`. A
+3-request `/allocs` keep-alive check held flat at `heap_allocations_total
+24` on both binaries, confirming the zero-heap invariant. `clippy-driver
+--edition 2021 -O main.rs` reports the same 8 pre-existing warnings on
+both sides of the change.

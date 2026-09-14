@@ -120,7 +120,7 @@ fn serve(mut stream: TcpStream) {
             let head = &buf[..head_end + 4];
             is_chunked(head)
         };
-        let mut decoded = [0u8; BODY_CAP];
+        let mut decoded: [u8; BODY_CAP];
         let body: &[u8];
         let consumed: usize;
         // 2b. expectations (RFC 7231 5.1.1): answered before any body byte
@@ -139,6 +139,7 @@ fn serve(mut stream: TcpStream) {
             if expect == Expect::Continue && !send_100(&mut stream, write_deadline()) {
                 return;
             }
+            decoded = [0u8; BODY_CAP];
             let mut pos = body_start;
             let dlen = match decode_chunked(&mut stream, &mut buf, body_start, &mut pos, &mut n, &mut decoded, &mut trailers, body_deadline) {
                 Ok(l) => l,
