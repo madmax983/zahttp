@@ -144,3 +144,44 @@ bash bench/measure_instructions.sh 20 100
 
 Both runs build with the currently documented `rustc` invocation for this
 repo (no `Cargo.toml`, no crates added).
+
+## 🔁 Re-baseline (2026-09-14)
+
+The fix above (PR #2) merged, but `main`'s history was subsequently
+force-reset to a point before that merge, so `main.rs` is back to
+unconditionally zero-initializing `decoded` on every request — this
+document's original "before" state, not its "after" one. Re-verified by
+reading `main.rs` directly: `let mut decoded = [0u8; BODY_CAP];` still
+sits before the `if chunked` check, unchanged from the original bug
+report.
+
+This session re-ran the harness fresh, on the exact commit this
+re-baseline is committed against, rather than trusting the numbers
+above (a different profile in every dimension: 92.5M Ir total here vs.
+71.0M in the original run, because `main`'s current tree also already
+carries the independent `write2_before` fix from PR #1's write-family
+work, which changes the shape of the rest of the profile).
+
+```
+bash bench/measure_instructions.sh 20 100
+```
+
+```
+92,479,581 (100.0%)  PROGRAM TOTALS
+
+32,482,539 (35.12%)  __memset_avx2_unaligned_erms  (libc)
+18,585,616 (20.10%)  main::gzip::gzip_encode        <- one-time LazyLock cost, out of scope
+ 8,299,220 ( 8.97%)  main::routes::send_chunked
+ 7,143,469 ( 7.72%)  __memcpy_avx_unaligned_erms
+ ...
+```
+
+`__memset_avx2_unaligned_erms` is again the target, now **35.12%** of
+the profile (larger than the original 21.79% simply because the rest of
+the profile shrank under PR #1's fix, not because `decoded` itself got
+more expensive). The mechanism is identical to the original report:
+`decoded`'s zero-init still runs unconditionally in `serve()`, but
+`decoded` is only ever read inside the `if chunked` branch, which this
+workload never takes. The fix — move `decoded = [0u8; BODY_CAP]` inside
+that branch — is re-applied in the next (GREEN) commit and re-measured
+from scratch rather than assuming the old numbers still hold.
