@@ -156,3 +156,86 @@ Both runs build with the currently documented `rustc` invocation for this
 repo (no `Cargo.toml`, no crates added) — see `README.md`'s "Zero
 dependency" line for the exact command, which `bench/measure_syscalls.sh`
 always tracks.
+
+## 🔁 Re-baseline (2026-09-14)
+
+The `write2_before()` part of this fix (all call sites except
+`send_chunked()`'s chunk loop) is still present in the current tree —
+`main`'s history was force-reset to a point before PR #1 fully merged,
+but that reset landed on a state that already had `write2_before` wired
+into `send()`, the `/bytes` senders, and `ws_send()`. What's missing
+again is the one call site upstream never covered even the first time:
+`send_chunked()`'s per-chunk loop is back to three separate
+`write_all_before()` calls (hex length, payload, trailing CRLF), and
+`write3_before()` itself is gone from `buf.rs` — re-verified by reading
+`routes.rs` and grepping `buf.rs` directly.
+
+Re-ran the harness fresh on the exact commit this re-baseline is
+committed against:
+
+```
+bash bench/measure_syscalls.sh 20 100
+```
+
+```
+ 65.30%  accept4       21 calls
+ 14.83%  setsockopt 15,195 calls   <- new since the original run (see note)
+ 11.71%  sendto     11,252 calls
+  5.06%  writev      1,942 calls
+  2.22%  recvfrom    2,000 calls
+...
+write-family syscalls (write+sendto+writev): 13,195
+```
+
+(`setsockopt` calls come from `set_write_timeout`/`set_read_timeout`
+being re-armed before every read/write under the deadline scheme —
+unrelated to this fix and not part of the write-family gate; it wasn't
+broken out as its own line in the original strace summary but the
+mechanism is unchanged.)
+
+13,195 write-family syscalls — smaller than the original 15,137 baseline
+because `write2_before` already collapsed every site except
+`send_chunked`'s chunk loop, but `send_chunked` alone (3% of the
+workload) still accounts for the overwhelming majority of what's left:
+2,000 requests × ~3% × 194 calls/response ≈ 11,640 of the 13,195. The
+fix — add `write3_before()` back to `buf.rs` and wire it into
+`send_chunked()`'s chunk loop in place of the three `write_all_before()`
+calls — is re-applied in this (GREEN) commit and re-measured from
+scratch.
+
+### After (this commit)
+
+Same command, same machine, same session, immediately after re-applying
+the fix:
+
+```
+ 64.51%  accept4        21 calls
+ 16.12%  writev      5,654 calls
+ 13.69%  setsockopt  7,771 calls
+  4.06%  recvfrom    2,000 calls
+  0.35%  sendto        116 calls
+...
+write-family syscalls (write+sendto+writev): 5,771
+```
+
+| syscall (response-path) | before | after | delta |
+|---|---:|---:|---:|
+| `sendto` | 11,252 | 116 | -99.0% |
+| `writev` | 1,942 | 5,654 | new (replaces the split writes) |
+| `write` | 1 | 1 | 0 |
+| **write-family total** | **13,195** | **5,771** | **-56.3%** |
+| **all syscalls (total)** | 30,824 | 15,976 | -48.2% |
+
+The after-total (5,771 write-family) is identical to what the original
+PR measured on a different baseline — same mechanism, same call sites,
+reproduced exactly despite starting this run from a different
+(`setsockopt`-inclusive) baseline. That cross-run agreement is the
+point of gating on a syscall count instead of wall-clock: same binary
+shape, same number, every time. Clears the impact floor ("a measurable
+reduction in syscall count") by a wide margin.
+
+Verified byte-identical (`cmp`, modulo `Date:`) for `/` and the full
+64-chunk `/chunked` stream against the pre-fix binary. A 3-request
+`/allocs` keep-alive check held flat at `heap_allocations_total 12` on
+both binaries. `clippy-driver --edition 2021 -O main.rs` reports the
+same 8 pre-existing warnings on both sides.

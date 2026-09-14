@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crate::alloc::{ALLOC_COUNT, REQUEST_COUNT};
-use crate::buf::{date_now, push_hex_u64, push_hex_usize, write2_before, write_all_before, Out, RESP_HEAD_CAP};
+use crate::buf::{date_now, push_hex_u64, push_hex_usize, write2_before, write3_before, write_all_before, Out, RESP_HEAD_CAP};
 use crate::http::{header, path_of, Request};
 use crate::multipart::serve_upload;
 
@@ -250,13 +250,7 @@ pub(crate) fn send_chunked(stream: &mut TcpStream, keep_alive: bool, deadline: I
         if c.overflow {
             return false;
         }
-        if !write_all_before(stream, c.as_slice(), deadline) {
-            return false;
-        }
-        if !write_all_before(stream, payload, deadline) {
-            return false;
-        }
-        if !write_all_before(stream, b"\r\n", deadline) {
+        if !write3_before(stream, c.as_slice(), payload, b"\r\n", deadline) {
             return false;
         }
         i += 1;
