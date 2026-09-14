@@ -44,6 +44,7 @@ The ~30 baseline is process startup and per-connection thread spawn —
 | `/allocs`    | GET    | heap allocation counter (the proof)                |
 | `/bytes`     | GET/HEAD | 64 KiB deterministic body with RFC 7233 ranges, `If-None-Match`, and `Accept-Encoding: gzip` (see below) |
 | `/upload`    | POST   | parses `multipart/form-data` bodies, returns a part summary (see below) |
+| `/trailers`  | POST   | echoes a chunked request's accepted trailer lines back, one per line (see below) |
 | `/events`    | GET/HEAD | Server-Sent Events: an infinite live tick feed, 1/s, `Last-Event-ID` resume (see below) |
 
 Also: proper `Date`/`Server`/`Content-Length`/`Connection` headers,
@@ -355,8 +356,9 @@ Both directions, still zero-allocation:
   `Content-Length` per RFC 7230 §3.3.3). A small state machine
   (`decode_chunked`) parses hex chunk sizes — extensions (`;foo=bar`)
   ignored, uppercase hex fine — streams chunk data into a fixed 4 KiB
-  buffer, validates the CRLF after each chunk, and swallows trailers.
-  Oversize decoded bodies → `413`; malformed framing → `400`. Buffer
+  buffer, validates the CRLF after each chunk, and parses the trailer
+  section (see below) instead of swallowing it. Oversize decoded bodies
+  → `413`; malformed framing → `400`. Buffer
   compaction reuses the read buffer *below* the request head (never
   clobbering it), so keep-alive cursor math stays exact — verified with
   a chunked POST pipelined ahead of a GET on one connection.
@@ -367,6 +369,33 @@ Both directions, still zero-allocation:
 The allocator proof covers the chunked path too: five chunked POSTs
 (with extensions, uppercase hex, and trailers) on one connection moved
 `/allocs` not at all.
+
+### Chunked trailers (strict contract, 2026-09-13)
+
+The old code swallowed trailer lines silently. Now the trailer section
+after the final `0\r\n` is parsed into stack-owned storage
+(`TrailerStore`: 16 lines × 256 bytes, no heap) and validated per
+RFC 9112 §7.1.2 — strictly:
+
+- **Syntax**: each line must be `name: value` with a token-only field
+  name. No colon, a non-token name → `400`.
+- **Bounds**: at most 16 trailer lines, each at most 256 bytes →
+  `400` past either bound.
+- **Forbidden fields** → `400` (not ignored): `Transfer-Encoding`,
+  `Content-Length`, `Trailer`, `TE`, `Host`, `Authorization`,
+  `Proxy-Authenticate`, `Proxy-Authorization`, `Expect`,
+  `Content-Encoding`, `Content-Type`, `Content-Range`. The first two are
+  the request-smuggling set — failing the request is the safe choice.
+- No `Trailer:` announcement header is required; unannounced trailers
+  are accepted and validated the same way.
+
+`POST /trailers` echoes the request's accepted trailer lines back as
+`name: value\n` lines (empty body when there are none); anything else on
+that path is `405`/`404` as usual. Covered by `trailer_test.py` — 13
+checks including a true red run against the pre-change binary (8 failed
+there: trailers swallowed, no `/trailers` route, smuggling fields
+accepted) and a zero-heap-delta proof over 40 trailer POSTs on one
+connection.
 
 ## WebSocket upgrade (the dare, 2026-09-12)
 
