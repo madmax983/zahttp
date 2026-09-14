@@ -11,7 +11,7 @@ use crate::multipart::serve_upload;
 
 // ---- routing ------------------------------------------------------------
 
-pub(crate) const INDEX: &str = "<!doctype html><html><head><title>zahttp</title><style>body{background:#0d0d0f;color:#c9a0ff;font-family:monospace;max-width:640px;margin:4rem auto;padding:0 1rem}h1{font-size:3rem}a{color:#7df9ff}</style></head><body><h1>zahttp &#x1f921;</h1><p>zero-dependency, zero-allocation HTTP/1.1. every byte on the stack.</p><ul><li><a href=\"/health\">/health</a></li><li><a href=\"/time\">/time</a></li><li><a href=\"/headers\">/headers</a></li><li><a href=\"/metrics\">/metrics</a></li><li><a href=\"/allocs\">/allocs</a></li><li><a href=\"/chunked\">/chunked</a> (chunked stream)</li><li><code>/ws</code> (websocket)</li><li><a href=\"/bytes\">/bytes</a> (ranges, conditionals, gzip)</li><li><code>/upload</code> (multipart/form-data)</li><li><a href=\"/events\">/events</a> (server-sent events)</li></ul><p>POST a body to <code>/echo</code> and get it back. Chunked request bodies welcome.</p></body></html>";
+pub(crate) const INDEX: &str = "<!doctype html><html><head><title>zahttp</title><style>body{background:#0d0d0f;color:#c9a0ff;font-family:monospace;max-width:640px;margin:4rem auto;padding:0 1rem}h1{font-size:3rem}a{color:#7df9ff}</style></head><body><h1>zahttp &#x1f921;</h1><p>zero-dependency, zero-allocation HTTP/1.1. every byte on the stack.</p><ul><li><a href=\"/health\">/health</a></li><li><a href=\"/time\">/time</a></li><li><a href=\"/headers\">/headers</a></li><li><a href=\"/metrics\">/metrics</a></li><li><a href=\"/allocs\">/allocs</a></li><li><a href=\"/chunked\">/chunked</a> (chunked stream)</li><li><code>/ws</code> (websocket)</li><li><a href=\"/bytes\">/bytes</a> (ranges, conditionals, gzip)</li><li><code>/upload</code> (multipart/form-data)</li><li><code>/trailers</code> (echo chunked request trailers)</li><li><a href=\"/events\">/events</a> (server-sent events)</li></ul><p>POST a body to <code>/echo</code> and get it back. Chunked request bodies welcome.</p></body></html>";
 
 // ---- OPTIONS (RFC 7231 4.2.7) -------------------------------------------
 // The methods each resource actually speaks; OPTIONS reports them in
@@ -22,7 +22,7 @@ pub(crate) fn allow_for(path: &str) -> Option<&'static str> {
         "/" | "/health" => "GET, HEAD, OPTIONS",
         "/bytes" => "GET, HEAD, OPTIONS",
         "/metrics" | "/allocs" | "/time" | "/headers" => "GET, OPTIONS",
-        "/echo" | "/upload" => "POST, OPTIONS",
+        "/echo" | "/upload" | "/trailers" => "POST, OPTIONS",
         "/chunked" | "/ws" => "GET, OPTIONS",
         "/events" => "GET, HEAD, OPTIONS",
         _ => return None,
@@ -70,6 +70,7 @@ pub(crate) fn route(req: &Request, out: &mut Out) -> (u16, &'static str) {
         || path == "/time"
         || path == "/headers"
         || path == "/echo"
+        || path == "/trailers"
         || path == "/chunked"
         || path == "/ws"
         || path == "/bytes"
@@ -118,6 +119,18 @@ pub(crate) fn route(req: &Request, out: &mut Out) -> (u16, &'static str) {
         }
         ("POST", "/echo") => {
             out.push(req.body);
+            (200, "text/plain")
+        }
+        ("POST", "/trailers") => {
+            // Echo the chunked request's accepted trailer lines back,
+            // one per line. Any request with no (or no valid) trailers
+            // answers 200 with an empty body.
+            let mut i = 0;
+            while i < req.trailers.count {
+                out.push(&req.trailers.lines[i][..req.trailers.lens[i]]);
+                out.push_str("\n");
+                i += 1;
+            }
             (200, "text/plain")
         }
         ("POST", "/upload") => match serve_upload(req, out) {
