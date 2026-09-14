@@ -45,7 +45,7 @@ use crate::alloc::REQUEST_COUNT;
 use crate::buf::{Out, BODY_CAP, READ_CAP, RESP_BODY_CAP};
 use crate::http::{
     content_length_of, decode_chunked, expect_of, find_double_crlf, is_chunked, keep_alive,
-    parse_head, path_of, read_before, send_100, Expect, Parse,
+    parse_head, path_of, read_before, send_100, Expect, Parse, TrailerStore,
 };
 use crate::ranges::send_ranges;
 use crate::routes::{route, send, send_chunked, send_options};
@@ -134,12 +134,13 @@ fn serve(mut stream: TcpStream) {
         // 2c. total body deadline, armed once the head is in: content-
         // length and chunked dribbles both die here.
         let body_deadline = Instant::now() + Duration::from_secs(BODY_TIMEOUT_SECS);
+        let mut trailers = TrailerStore::empty();
         if chunked {
             if expect == Expect::Continue && !send_100(&mut stream, write_deadline()) {
                 return;
             }
             let mut pos = body_start;
-            let dlen = match decode_chunked(&mut stream, &mut buf, body_start, &mut pos, &mut n, &mut decoded, body_deadline) {
+            let dlen = match decode_chunked(&mut stream, &mut buf, body_start, &mut pos, &mut n, &mut decoded, &mut trailers, body_deadline) {
                 Ok(l) => l,
                 Err(s) => {
                     let msg: &[u8] = if s == 413 { b"body too large\n" } else { b"bad request\n" };
@@ -195,6 +196,7 @@ fn serve(mut stream: TcpStream) {
             Parse::Ready(r) => r,
         };
         req.body = body;
+        req.trailers = trailers;
         served += 1;
         // Total write deadline for this response, armed now that the
         // request is fully in. Streams re-arm it per event/frame inside
