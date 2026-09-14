@@ -225,5 +225,47 @@ pub(crate) fn write2_before(
     }
 }
 
+// write3_before is write2_before's three-buffer twin, for send_chunked's
+// per-chunk hex-length/payload/CRLF triple — same single-writev contract,
+// same partial-write handling.
+pub(crate) fn write3_before(
+    stream: &mut TcpStream,
+    a: &[u8],
+    b: &[u8],
+    c: &[u8],
+    deadline: Instant,
+) -> bool {
+    let mut a = a;
+    let mut b = b;
+    let mut c = c;
+    loop {
+        if a.is_empty() && b.is_empty() && c.is_empty() {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let _ = stream.set_write_timeout(Some(remaining));
+        let bufs = [IoSlice::new(a), IoSlice::new(b), IoSlice::new(c)];
+        let from = usize::from(a.is_empty()) + usize::from(a.is_empty() && b.is_empty());
+        match stream.write_vectored(&bufs[from..]) {
+            Ok(0) => return false,
+            Ok(n) => {
+                let mut rem = n;
+                let take = rem.min(a.len());
+                a = &a[take..];
+                rem -= take;
+                let take = rem.min(b.len());
+                b = &b[take..];
+                rem -= take;
+                c = &c[rem.min(c.len())..];
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+}
+
 // Parse one byte-range-spec into an inclusive (first, last). False when
 // malformed or unsatisfiable against `total`.

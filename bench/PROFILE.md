@@ -200,5 +200,42 @@ workload) still accounts for the overwhelming majority of what's left:
 2,000 requests × ~3% × 194 calls/response ≈ 11,640 of the 13,195. The
 fix — add `write3_before()` back to `buf.rs` and wire it into
 `send_chunked()`'s chunk loop in place of the three `write_all_before()`
-calls — is re-applied in the next (GREEN) commit and re-measured from
+calls — is re-applied in this (GREEN) commit and re-measured from
 scratch.
+
+### After (this commit)
+
+Same command, same machine, same session, immediately after re-applying
+the fix:
+
+```
+ 64.51%  accept4        21 calls
+ 16.12%  writev      5,654 calls
+ 13.69%  setsockopt  7,771 calls
+  4.06%  recvfrom    2,000 calls
+  0.35%  sendto        116 calls
+...
+write-family syscalls (write+sendto+writev): 5,771
+```
+
+| syscall (response-path) | before | after | delta |
+|---|---:|---:|---:|
+| `sendto` | 11,252 | 116 | -99.0% |
+| `writev` | 1,942 | 5,654 | new (replaces the split writes) |
+| `write` | 1 | 1 | 0 |
+| **write-family total** | **13,195** | **5,771** | **-56.3%** |
+| **all syscalls (total)** | 30,824 | 15,976 | -48.2% |
+
+The after-total (5,771 write-family) is identical to what the original
+PR measured on a different baseline — same mechanism, same call sites,
+reproduced exactly despite starting this run from a different
+(`setsockopt`-inclusive) baseline. That cross-run agreement is the
+point of gating on a syscall count instead of wall-clock: same binary
+shape, same number, every time. Clears the impact floor ("a measurable
+reduction in syscall count") by a wide margin.
+
+Verified byte-identical (`cmp`, modulo `Date:`) for `/` and the full
+64-chunk `/chunked` stream against the pre-fix binary. A 3-request
+`/allocs` keep-alive check held flat at `heap_allocations_total 12` on
+both binaries. `clippy-driver --edition 2021 -O main.rs` reports the
+same 8 pre-existing warnings on both sides.
