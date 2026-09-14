@@ -21,6 +21,7 @@ pub(crate) struct Request<'a> {
     pub(crate) headers: [Option<Header<'a>>; HDR_MAX],
     pub(crate) header_count: usize,
     pub(crate) body: &'a [u8],
+    pub(crate) trailers: TrailerStore, // chunked request trailers, if any
 }
 
 pub(crate) enum Parse<'a> {
@@ -116,6 +117,7 @@ pub(crate) fn parse_head(head: &[u8]) -> Parse<'_> {
         headers,
         header_count: count,
         body: &[],
+        trailers: TrailerStore::empty(),
     })
 }
 
@@ -348,10 +350,74 @@ pub(crate) fn expect_crlf(
     }
 }
 
+// ---- chunked trailers (RFC 9112 7.1.2) ---------------------------------
+
+pub(crate) const MAX_TRAILERS: usize = 16; // most trailer lines per request
+pub(crate) const TRAILER_LINE_MAX: usize = 256; // longest single trailer line
+
+// Accepted trailers, owned copies on the stack: trailer bytes are read
+// out of the shared stream buffer, whose contents shift under keep-alive
+// compaction, so borrowing them would dangle.
+#[derive(Clone, Copy)]
+pub(crate) struct TrailerStore {
+    pub(crate) count: usize,
+    pub(crate) lines: [[u8; TRAILER_LINE_MAX]; MAX_TRAILERS],
+    pub(crate) lens: [usize; MAX_TRAILERS],
+}
+
+impl TrailerStore {
+    pub(crate) fn empty() -> TrailerStore {
+        TrailerStore {
+            count: 0,
+            lines: [[0u8; TRAILER_LINE_MAX]; MAX_TRAILERS],
+            lens: [0usize; MAX_TRAILERS],
+        }
+    }
+}
+
+fn is_token(name: &[u8]) -> bool {
+    const TCHARS: &[u8] = b"!#$%&'*+-.^_`|~";
+    !name.is_empty() && name.iter().all(|&c| c.is_ascii_alphanumeric() || TCHARS.contains(&c))
+}
+
+// Validate one trailer line; returns the trimmed field name so the caller
+// can run the forbidden-field screen.
+fn trailer_name(line: &[u8]) -> Result<&[u8], u16> {
+    let colon = match line.iter().position(|&c| c == b':') {
+        Some(p) => p,
+        None => return Err(400),
+    };
+    let name = trim(&line[..colon]);
+    if !is_token(name) {
+        return Err(400);
+    }
+    Ok(name)
+}
+
+// Fields a sender must never put in a trailer section (RFC 9112 7.1.2):
+// framing, routing, auth, expectations, and content-processing fields.
+// Content-Length / Transfer-Encoding here are the request-smuggling set,
+// so they fail the whole request with 400 instead of being ignored.
+fn is_forbidden_trailer(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"transfer-encoding")
+        || name.eq_ignore_ascii_case(b"content-length")
+        || name.eq_ignore_ascii_case(b"trailer")
+        || name.eq_ignore_ascii_case(b"te")
+        || name.eq_ignore_ascii_case(b"host")
+        || name.eq_ignore_ascii_case(b"authorization")
+        || name.eq_ignore_ascii_case(b"proxy-authenticate")
+        || name.eq_ignore_ascii_case(b"proxy-authorization")
+        || name.eq_ignore_ascii_case(b"expect")
+        || name.eq_ignore_ascii_case(b"content-encoding")
+        || name.eq_ignore_ascii_case(b"content-type")
+        || name.eq_ignore_ascii_case(b"content-range")
+}
+
 // Decode a chunked request body. Encoded bytes are pulled from the stream
 // into buf (cursor *pos, valid bytes *n, compaction floor `floor`);
-// decoded bytes accumulate in `out`. Returns the decoded length; *pos ends
-// just past the body's final CRLF so keep-alive stays exact.
+// decoded bytes accumulate in `out`. Accepted trailer lines accumulate in
+// `trailers`. Returns the decoded length; *pos ends just past the body's
+// final CRLF so keep-alive stays exact.
 pub(crate) fn decode_chunked(
     stream: &mut TcpStream,
     buf: &mut [u8],
@@ -359,6 +425,7 @@ pub(crate) fn decode_chunked(
     pos: &mut usize,
     n: &mut usize,
     out: &mut [u8],
+    trailers: &mut TrailerStore,
     deadline: Instant,
 ) -> Result<usize, u16> {
     let mut dlen = 0usize;
@@ -367,12 +434,36 @@ pub(crate) fn decode_chunked(
         let llen = read_line(stream, buf, floor, pos, n, &mut line, deadline)?;
         let size = parse_chunk_size(&line[..llen])?;
         if size == 0 {
-            // final chunk: swallow trailers until the empty line
+            // final chunk: parse the trailer section into stack-owned
+            // storage. Each line is syntax-checked (`name: value` with a
+            // token-only name), bounded (at most MAX_TRAILERS lines, each
+            // at most TRAILER_LINE_MAX bytes), and screened against the
+            // RFC 9112 7.1.2 forbidden list (framing, routing, auth, and
+            // content fields — the request-smuggling set). Any violation
+            // is a 400; accepted trailers are kept for the /trailers
+            // route. Unannounced trailers are accepted: no `Trailer:`
+            // header is required.
             loop {
-                let tl = read_line(stream, buf, floor, pos, n, &mut line, deadline)?;
+                // At the bound only the empty terminator may follow; a
+                // 17th real trailer line is a 400.
+                if trailers.count == MAX_TRAILERS {
+                    let tl = read_line(stream, buf, floor, pos, n, &mut line, deadline)?;
+                    if tl != 0 {
+                        return Err(400);
+                    }
+                    break;
+                }
+                let slot = &mut trailers.lines[trailers.count];
+                let tl = read_line(stream, buf, floor, pos, n, slot, deadline)?;
                 if tl == 0 {
                     break;
                 }
+                let name = trailer_name(&slot[..tl])?;
+                if is_forbidden_trailer(name) {
+                    return Err(400);
+                }
+                trailers.lens[trailers.count] = tl;
+                trailers.count += 1;
             }
             return Ok(dlen);
         }
