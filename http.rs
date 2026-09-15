@@ -148,38 +148,6 @@ pub(crate) fn parse_usize(s: &str) -> Option<usize> {
     Some(v)
 }
 
-// Read before the full parse: how many body bytes to expect. The borrow
-// ends when this returns, so the body read can take &mut buf afterwards.
-pub(crate) fn content_length_of(head: &[u8]) -> Result<usize, u16> {
-    let mut rest = match head.windows(2).position(|w| w == b"\r\n") {
-        Some(p) => &head[p + 2..],
-        None => return Err(400),
-    };
-    while !rest.is_empty() {
-        let eol = match rest.windows(2).position(|w| w == b"\r\n") {
-            Some(p) => p,
-            None => return Err(400),
-        };
-        let line = &rest[..eol];
-        rest = &rest[eol + 2..];
-        let colon = match line.iter().position(|&c| c == b':') {
-            Some(p) => p,
-            None => continue, // the full parser will reject this line later
-        };
-        if trim(&line[..colon]).eq_ignore_ascii_case(b"content-length") {
-            let v = match core::str::from_utf8(trim(&line[colon + 1..])) {
-                Ok(s) => s,
-                Err(_) => return Err(400),
-            };
-            return match parse_usize(v) {
-                Some(c) => Ok(c),
-                None => Err(400),
-            };
-        }
-    }
-    Ok(0)
-}
-
 // path without the query string; borrows the target
 pub(crate) fn path_of(target: &str) -> &str {
     match target.find('?') {
@@ -188,13 +156,36 @@ pub(crate) fn path_of(target: &str) -> &str {
     }
 }
 
-// true when any Transfer-Encoding header lists the "chunked" token.
-// Comma-separated values are honored; matching is case-insensitive.
-pub(crate) fn is_chunked(head: &[u8]) -> bool {
-    let mut rest = match head.windows(2).position(|w| w == b"\r\n") {
-        Some(p) => &head[p + 2..],
-        None => return false,
+// Combined result of scan_head: everything serve() needs to know about
+// framing and expectations before it reads a single body byte.
+pub(crate) struct HeadScan {
+    pub(crate) chunked: bool,
+    pub(crate) content_length: Result<usize, u16>,
+    pub(crate) expect: Expect,
+}
+
+// One pass over the header lines that answers what is_chunked,
+// content_length_of, and expect_of used to answer with three separate
+// full walks of the same bytes: is any Transfer-Encoding "chunked"-listed
+// (comma-separated, case-insensitive, first true occurrence across
+// possibly-repeated headers), what does the first Content-Length say, and
+// what does the first Expect say (HTTP/1.0 clients never get one). Each
+// field keeps the exact matching, trimming, and error rules of its
+// original function; only the header-line walk itself is shared.
+pub(crate) fn scan_head(head: &[u8]) -> HeadScan {
+    let req_line_end = match head.windows(2).position(|w| w == b"\r\n") {
+        Some(p) => p,
+        None => return HeadScan { chunked: false, content_length: Err(400), expect: Expect::None },
     };
+    let http10 = head[..req_line_end].ends_with(b"HTTP/1.0");
+
+    let mut chunked = false;
+    let mut content_length: Result<usize, u16> = Ok(0);
+    let mut content_length_found = false;
+    let mut expect = Expect::None;
+    let mut expect_found = false;
+
+    let mut rest = &head[req_line_end + 2..];
     while !rest.is_empty() {
         let (line, next) = match rest.windows(2).position(|w| w == b"\r\n") {
             Some(p) => (&rest[..p], &rest[p + 2..]),
@@ -203,24 +194,40 @@ pub(crate) fn is_chunked(head: &[u8]) -> bool {
         rest = next;
         let colon = match line.iter().position(|&c| c == b':') {
             Some(p) => p,
-            None => continue,
+            None => continue, // the full parser will reject this line later
         };
-        if !trim(&line[..colon]).eq_ignore_ascii_case(b"transfer-encoding") {
-            continue;
-        }
-        let mut tok = trim(&line[colon + 1..]);
-        while !tok.is_empty() {
-            let (t, next_tok) = match tok.iter().position(|&c| c == b',') {
-                Some(p) => (&tok[..p], &tok[p + 1..]),
-                None => (tok, &tok[tok.len()..]),
-            };
-            if trim(t).eq_ignore_ascii_case(b"chunked") {
-                return true;
+        let name = trim(&line[..colon]);
+        let value = &line[colon + 1..];
+
+        if !chunked && name.eq_ignore_ascii_case(b"transfer-encoding") {
+            let mut tok = trim(value);
+            while !tok.is_empty() {
+                let (t, next_tok) = match tok.iter().position(|&c| c == b',') {
+                    Some(p) => (&tok[..p], &tok[p + 1..]),
+                    None => (tok, &tok[tok.len()..]),
+                };
+                if trim(t).eq_ignore_ascii_case(b"chunked") {
+                    chunked = true;
+                    break;
+                }
+                tok = next_tok;
             }
-            tok = next_tok;
+        } else if !content_length_found && name.eq_ignore_ascii_case(b"content-length") {
+            content_length_found = true;
+            content_length = match core::str::from_utf8(trim(value)) {
+                Ok(s) => match parse_usize(s) {
+                    Some(c) => Ok(c),
+                    None => Err(400),
+                },
+                Err(_) => Err(400),
+            };
+        } else if !expect_found && !http10 && name.eq_ignore_ascii_case(b"expect") {
+            expect_found = true;
+            let v = trim(value);
+            expect = if v.eq_ignore_ascii_case(b"100-continue") { Expect::Continue } else { Expect::Other };
         }
     }
-    false
+    HeadScan { chunked, content_length, expect }
 }
 
 // Parse a chunk-size line: 1*HEXDIG, optional ";extension", tolerant of
@@ -516,39 +523,6 @@ pub(crate) enum Expect {
     None,
     Continue,
     Other,
-}
-
-// Scan the raw head for an Expect header. HTTP/1.0 clients never get a
-// 100-continue: the interim status would confuse their framing.
-pub(crate) fn expect_of(head: &[u8]) -> Expect {
-    let req_line_end = match head.windows(2).position(|w| w == b"\r\n") {
-        Some(p) => p,
-        None => return Expect::None,
-    };
-    if head[..req_line_end].ends_with(b"HTTP/1.0") {
-        return Expect::None;
-    }
-    let mut rest = &head[req_line_end + 2..];
-    while !rest.is_empty() {
-        let eol = match rest.windows(2).position(|w| w == b"\r\n") {
-            Some(p) => p,
-            None => return Expect::None,
-        };
-        let line = &rest[..eol];
-        rest = &rest[eol + 2..];
-        let colon = match line.iter().position(|&c| c == b':') {
-            Some(p) => p,
-            None => continue,
-        };
-        if trim(&line[..colon]).eq_ignore_ascii_case(b"expect") {
-            let v = trim(&line[colon + 1..]);
-            if v.eq_ignore_ascii_case(b"100-continue") {
-                return Expect::Continue;
-            }
-            return Expect::Other;
-        }
-    }
-    Expect::None
 }
 
 pub(crate) fn send_100(stream: &mut TcpStream, deadline: Instant) -> bool {

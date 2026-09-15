@@ -93,25 +93,61 @@ calls them). Every line-matching rule, trim, and error code is copied
 verbatim from the three originals; no public behavior, status code, or byte
 layout changes.
 
-## 📊 Measurement (baseline — see PROFILE_SCANHEAD.md's follow-up commit for after)
+## 📊 Measurement
 
 `bench/measure_instructions.sh 20 100`, same fixed seeded workload, same
-machine, same session, run twice back-to-back to confirm determinism before
-touching any code:
+machine, same session — `valgrind --tool=callgrind` Ir, before vs. after:
 
-| counter | run 1 | run 2 |
-|---|---:|---:|
-| total instructions (Ir) | 82,430,398 | 82,430,398 |
-| `main::http::is_chunked` | 2,728,166 | 2,728,166 |
-| `main::http::content_length_of` | 2,601,963 | 2,601,963 |
-| `main::http::expect_of` | 2,502,961 | 2,502,961 |
+| counter | before | after | delta |
+|---|---:|---:|---:|
+| total instructions (Ir) | 82,430,398 | 77,574,566 | **-5.89%** |
+| `is_chunked` + `content_length_of` + `expect_of` (self cost, combined) | 7,833,090 | — | removed |
+| `main::http::scan_head` (self cost, replaces all three) | — | 2,998,599 | **-61.72%** vs. the three combined |
 
-Identical to the instruction on both runs — this is the committed baseline
-the fix (next commit) is measured against.
+Both counters clear the impact floor ("≥5% reduction in instruction count
+on a benchmark that represents ≥5% of realistic workload cost") — the
+total-program reduction alone (5.89%) clears it on a target that was 9.51%
+of the profile. Re-run twice on the after side to confirm determinism:
+`scan_head` landed at exactly 2,998,599 both times; total Ir was
+77,574,566 and 77,574,586 (a 20-instruction, 0.00003% wobble — noise far
+below the ~4.86M-instruction delta being measured, consistent with this
+being shared-vCPU hardware).
+
+Every other line in the breakdown (`gzip_encode`, `send_chunked`, `memcpy`,
+`parse_head`, `from_utf8`, `trim`, `send`, ...) is unchanged between the
+two runs, self-cost for self-cost — this change touches nothing else on
+the request path.
+
+Functional verification (this project has no unit test harness — see
+README.md — so, matching prior PRs' method): built old and new binaries
+from the same commit range, ran both under the same workload via
+`bench/measure_instructions.sh`'s harness (2000/2000 ok on both), and
+`cmp`'d direct-curl responses for `/`, `/health`, `/headers`, `POST /echo`
+(`Content-Length`), `GET /bytes` (plain and gzip), and `/chunked` —
+byte-identical on every static/deterministic route (the three dynamic
+counters, `/time`, `/metrics`, `/allocs`, differ only by wall-clock/
+per-process counter value, as expected). Additional raw-socket checks
+against the new binary: chunked body decode, `Expect: 100-continue`,
+`Expect: bogus` → 417, invalid `Content-Length` → 400, an HTTP/1.0 request
+carrying `Expect: 100-continue` (correctly ignored — no interim response),
+two `Transfer-Encoding` header lines where only the second lists `chunked`
+(correctly detected), and a request carrying both `Content-Length` and
+`Transfer-Encoding: chunked` (chunked correctly wins per RFC 7230 3.3.3,
+Content-Length ignored) — all matched pre-change behavior. A 3-request
+`/allocs` keep-alive check on the new binary held flat
+(`heap_allocations_total 6` on all three), confirming the zero-heap
+invariant.
+
+`clippy-driver --edition 2021 -O main.rs` reports the same 8 pre-existing
+warnings on both sides of the change, none new or removed, none pointing
+at `scan_head` or its callers.
 
 ## 🔬 Reproduce
 
 ```
-git checkout <this commit>     # baseline, no fix yet
+git checkout <RED commit>      # this baseline, no fix yet
+bash bench/measure_instructions.sh 20 100
+
+git checkout <GREEN commit>    # scan_head fix applied
 bash bench/measure_instructions.sh 20 100
 ```
