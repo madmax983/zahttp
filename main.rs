@@ -44,8 +44,8 @@ use std::time::{Duration, Instant};
 use crate::alloc::REQUEST_COUNT;
 use crate::buf::{Out, BODY_CAP, READ_CAP, RESP_BODY_CAP};
 use crate::http::{
-    content_length_of, decode_chunked, expect_of, find_double_crlf, is_chunked, keep_alive,
-    parse_head, path_of, read_before, send_100, Expect, Parse, TrailerStore,
+    decode_chunked, find_double_crlf, keep_alive, parse_head, path_of, read_before, scan_head,
+    send_100, Expect, Parse, TrailerStore,
 };
 use crate::ranges::send_ranges;
 use crate::routes::{route, send, send_chunked, send_options};
@@ -116,17 +116,18 @@ fn serve(mut stream: TcpStream) {
         // The head slice includes the trailing \r\n\r\n so the last header
         // line always has a line ending for the scanners below.
         let body_start = head_end + 4;
-        let chunked = {
-            let head = &buf[..head_end + 4];
-            is_chunked(head)
-        };
+        // scan_head answers framing (chunked / Content-Length) and
+        // expectations in one pass over the header lines instead of three
+        // separate full walks (see bench/PROFILE_SCANHEAD.md).
+        let head_scan = scan_head(&buf[..head_end + 4]);
+        let chunked = head_scan.chunked;
         let mut decoded: [u8; BODY_CAP];
         let body: &[u8];
         let consumed: usize;
         // 2b. expectations (RFC 7231 5.1.1): answered before any body byte
         // is read. Unknown expectations fail fast with 417; a 100-continue
         // is only ever sent when a body is actually coming.
-        let expect = expect_of(&buf[..head_end + 4]);
+        let expect = head_scan.expect;
         if expect == Expect::Other {
             send(&mut stream, 417, "text/plain", b"expectation failed\n", false, true, write_deadline());
             return;
@@ -152,14 +153,11 @@ fn serve(mut stream: TcpStream) {
             consumed = pos;
             body = &decoded[..dlen];
         } else {
-            let content_length = {
-                let head = &buf[..head_end + 4];
-                match content_length_of(head) {
-                    Ok(c) => c,
-                    Err(s) => {
-                        send(&mut stream, s, "text/plain", b"bad request\n", false, true, write_deadline());
-                        return;
-                    }
+            let content_length = match head_scan.content_length {
+                Ok(c) => c,
+                Err(s) => {
+                    send(&mut stream, s, "text/plain", b"bad request\n", false, true, write_deadline());
+                    return;
                 }
             };
             if content_length > BODY_CAP {
