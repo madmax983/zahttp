@@ -76,22 +76,18 @@ pub(crate) const HEX: &[u8; 16] = b"0123456789abcdef";
 
 pub(crate) fn push_hex_u64(o: &mut Out, v: u64) {
     let mut tmp = [0u8; 16];
-    let mut n = 0usize;
-    if v == 0 {
-        tmp[0] = b'0';
-        n = 1;
+    let n = if v == 0 {
+        1
     } else {
-        let mut x = v;
-        while x > 0 && n < tmp.len() {
-            tmp[n] = HEX[(x & 15) as usize];
-            x >>= 4;
-            n += 1;
-        }
+        (64 - v.leading_zeros() as usize + 3) / 4
+    };
+    let mut i = 0;
+    while i < n {
+        let shift = 4 * (n - 1 - i);
+        tmp[i] = HEX[((v >> shift) & 15) as usize];
+        i += 1;
     }
-    while n > 0 {
-        n -= 1;
-        o.push(&tmp[n..n + 1]);
-    }
+    o.push(&tmp[..n]);
 }
 
 pub(crate) fn push_hex_usize(o: &mut Out, v: usize) {
