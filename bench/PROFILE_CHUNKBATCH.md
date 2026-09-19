@@ -80,16 +80,62 @@ instead of a fresh per-chunk buffer flushed immediately, append the
 
 ## 📊 Measurement
 
-Baseline recorded above. After-numbers and the delta will be recorded in
-the next (GREEN) commit once the fix lands, from the same harness, same
-machine, same session.
+`bench/measure_syscalls.sh 20 100`, same fixed seeded workload, same
+machine, same session — `strace -f -c`, before vs. after:
+
+```
+after:
+ 63.67%  accept4         21 calls
+ 15.07%  writev       2,000 calls
+ 12.27%  setsockopt   4,001 calls
+  6.78%  recvfrom     2,000 calls
+  ...
+write-family syscalls (write+sendto+writev): 2001
+all syscalls (total): 8436
+```
+
+| syscall (response-path) | before | after | delta |
+|---|---:|---:|---:|
+| `writev` | 5,654 | 2,000 | -64.6% |
+| `sendto` | 116 | 0 | -100% |
+| `write` | 1 | 1 | 0 |
+| **write-family total** | **5,771** | **2,001** | **-65.3%** |
+| `setsockopt` | 7,771 | 4,001 | -48.5% |
+| **all syscalls (total)** | **15,976** | **8,436** | **-47.2%** |
+
+`writev` now equals exactly the request count (2,000) — every response in
+the workload, `/chunked` included, leaves in exactly one `writev` call.
+Clears the impact floor ("a measurable reduction in syscall count") by a
+wide margin; `setsockopt` falls by the same 3,770 calls for free, since it
+tracks 1:1 with every read and write call re-arming the deadline.
+
+Re-ran the harness twice on the after side to confirm determinism:
+write-family was 2,001 both times (identical to the instruction-count
+harness's near-zero wobble reported in `bench/PROFILE_HEXPUSH.md`, syscall
+counts on this deterministic workload show none at all, consistent with
+every prior PR that gated on this counter — see `bench/PROFILE.md`).
+
+Functional verification (this project has no unit test harness — see
+README.md — so, matching prior PRs' method): built old (pre-fix) and new
+binaries from the same commit range and ran both, standalone (outside the
+harness). `cmp`'d direct responses (`Date:` header normalized) for `/`,
+`/health`, `/headers`, and the full 64-chunk `/chunked` body — byte-for-byte
+identical on every route, confirming the chunk batching changed no
+observable bytes. A 3-request `/allocs` keep-alive check plus a `/chunked`
+request in between held `heap_allocations_total` flat at 6 across all five
+requests on the new binary, confirming the zero-heap invariant (the larger
+`CHUNKED_BODY_CAP` stack buffer is still stack, not heap).
+
+`clippy-driver --edition 2021 -O main.rs` reports the same 9 pre-existing
+warnings on both sides of the change, none new or removed, none pointing at
+`send_chunked` or the removed `write3_before`.
 
 ## 🔬 Reproduce
 
 ```
-git checkout <this commit>      # RED: baseline only, no fix yet
+git checkout 141d006      # RED: this baseline, no fix yet
 bash bench/measure_syscalls.sh 20 100
 
-git checkout <next commit>      # GREEN: fix applied
+git checkout <GREEN commit>    # fix applied
 bash bench/measure_syscalls.sh 20 100
 ```
