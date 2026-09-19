@@ -11,6 +11,11 @@ pub(crate) const BODY_CAP: usize = 4096; // largest request body we accept
 pub(crate) const HDR_MAX: usize = 32; // most headers per request
 pub(crate) const RESP_HEAD_CAP: usize = 512;
 pub(crate) const RESP_BODY_CAP: usize = 4096;
+// routes::send_chunked's whole body (64 chunks + terminator), batched into
+// one buffer instead of 66 separate writes. Worst case per chunk is 84
+// bytes (4-byte hex-length header + 78-byte payload + 2-byte CRLF) x 64
+// chunks + 5-byte "0\r\n\r\n" terminator = 5,381 bytes; sized with headroom.
+pub(crate) const CHUNKED_BODY_CAP: usize = 6144;
 
 // ---- Out: a tiny non-allocating byte writer over a fixed buffer ---------
 
@@ -214,48 +219,6 @@ pub(crate) fn write2_before(
                 a = &a[take..];
                 rem -= take;
                 b = &b[rem.min(b.len())..];
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return false,
-        }
-    }
-}
-
-// write3_before is write2_before's three-buffer twin, for send_chunked's
-// per-chunk hex-length/payload/CRLF triple — same single-writev contract,
-// same partial-write handling.
-pub(crate) fn write3_before(
-    stream: &mut TcpStream,
-    a: &[u8],
-    b: &[u8],
-    c: &[u8],
-    deadline: Instant,
-) -> bool {
-    let mut a = a;
-    let mut b = b;
-    let mut c = c;
-    loop {
-        if a.is_empty() && b.is_empty() && c.is_empty() {
-            return true;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-        let _ = stream.set_write_timeout(Some(remaining));
-        let bufs = [IoSlice::new(a), IoSlice::new(b), IoSlice::new(c)];
-        let from = usize::from(a.is_empty()) + usize::from(a.is_empty() && b.is_empty());
-        match stream.write_vectored(&bufs[from..]) {
-            Ok(0) => return false,
-            Ok(n) => {
-                let mut rem = n;
-                let take = rem.min(a.len());
-                a = &a[take..];
-                rem -= take;
-                let take = rem.min(b.len());
-                b = &b[take..];
-                rem -= take;
-                c = &c[rem.min(c.len())..];
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => return false,
