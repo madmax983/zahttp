@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crate::alloc::{ALLOC_COUNT, REQUEST_COUNT};
-use crate::buf::{date_now, push_hex_u64, push_hex_usize, write2_before, write3_before, write_all_before, Out, RESP_HEAD_CAP};
+use crate::buf::{date_now, push_hex_u64, push_hex_usize, write2_before, write_all_before, Out, CHUNKED_BODY_CAP, RESP_HEAD_CAP};
 use crate::http::{header, path_of, Request};
 use crate::multipart::serve_upload;
 
@@ -216,9 +216,18 @@ pub(crate) fn send_chunked(stream: &mut TcpStream, keep_alive: bool, deadline: I
     h.push_str("\r\nServer: zahttp/0.1\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: ");
     h.push_str(if keep_alive { "keep-alive" } else { "close" });
     h.push_str("\r\n\r\n");
-    if h.overflow || !write_all_before(stream, h.as_slice(), deadline) {
+    if h.overflow {
         return false;
     }
+    // All 64 chunks (hex length + CRLF + payload + CRLF) plus the
+    // terminating "0\r\n\r\n" are built into one buffer instead of flushed
+    // with a separate write per chunk, so the whole response leaves
+    // alongside the header in a single write2_before() writev — see
+    // bench/PROFILE_CHUNKBATCH.md. Nothing paces these chunks (unlike
+    // sse.rs's /events, which sleeps between frames), so batching them
+    // changes no observable timing or bytes.
+    let mut bbuf = [0u8; CHUNKED_BODY_CAP];
+    let mut b = Out::new(&mut bbuf);
     let mut rng = 0x12345678u64;
     let mut i = 0u32;
     while i < 64 {
@@ -243,17 +252,15 @@ pub(crate) fn send_chunked(stream: &mut TcpStream, keep_alive: bool, deadline: I
             return false;
         }
         let payload = p.as_slice();
-        let mut cbuf = [0u8; 24];
-        let mut c = Out::new(&mut cbuf);
-        push_hex_usize(&mut c, payload.len());
-        c.push_str("\r\n");
-        if c.overflow {
-            return false;
-        }
-        if !write3_before(stream, c.as_slice(), payload, b"\r\n", deadline) {
-            return false;
-        }
+        push_hex_usize(&mut b, payload.len());
+        b.push_str("\r\n");
+        b.push(payload);
+        b.push_str("\r\n");
         i += 1;
     }
-    write_all_before(stream, b"0\r\n\r\n", deadline)
+    b.push_str("0\r\n\r\n");
+    if b.overflow {
+        return false;
+    }
+    write2_before(stream, h.as_slice(), b.as_slice(), deadline)
 }
