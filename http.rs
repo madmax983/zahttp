@@ -55,7 +55,7 @@ pub(crate) fn split_request_line(line: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
     Some((method, target, version))
 }
 
-pub(crate) fn parse_head(head: &[u8]) -> Parse<'_> {
+pub(crate) fn parse_head(head: &[u8], trailers: TrailerStore) -> Parse<'_> {
     let eol = match head.windows(2).position(|w| w == b"\r\n") {
         Some(p) => p,
         None => return Parse::NeedMore, // unreachable: caller found \r\n\r\n
@@ -117,7 +117,7 @@ pub(crate) fn parse_head(head: &[u8]) -> Parse<'_> {
         headers,
         header_count: count,
         body: &[],
-        trailers: TrailerStore::empty(),
+        trailers,
     })
 }
 
