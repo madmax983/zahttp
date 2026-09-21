@@ -183,7 +183,7 @@ fn serve(mut stream: TcpStream) {
         }
         // 3. parse (borrows buf), route, respond
         let head = &buf[..head_end + 4];
-        let mut req = match parse_head(head) {
+        let mut req = match parse_head(head, trailers) {
             Parse::NeedMore | Parse::Fail(400) => {
                 send(&mut stream, 400, "text/plain", b"bad request\n", false, true, write_deadline());
                 return;
@@ -195,7 +195,6 @@ fn serve(mut stream: TcpStream) {
             Parse::Ready(r) => r,
         };
         req.body = body;
-        req.trailers = trailers;
         served += 1;
         // Total write deadline for this response, armed now that the
         // request is fully in. Streams re-arm it per event/frame inside
